@@ -21,7 +21,11 @@ const TIME_WINDOWS = [
 ];
 
 const POLL_INTERVAL_MS = 3000;
-const POLL_TIMEOUT_MS = 180000; // 3 min — Firecrawl batch jobs queue + run; be patient.
+// No hard client timeout. We poll as long as Firecrawl says the job is alive
+// (status=scraping). Real expiration comes from Firecrawl's own expiresAt field.
+// We warn the user if the job appears stuck (no field changes for STUCK_WARN_MS)
+// but never auto-kill — they cancel manually.
+const STUCK_WARN_MS = 90000;
 
 function mmddyyyy(d) { return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`; }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -41,6 +45,7 @@ export default function App() {
   const [currentJobId, setCurrentJobId] = useState(null);
   const [pollCount, setPollCount] = useState(0);
   const [lenderElapsed, setLenderElapsed] = useState(0);
+  const [lastPoll, setLastPoll] = useState(null); // full last poll response
   const [log, setLog] = useState([]);             // [{time, msg}]
   const [perLender, setPerLender] = useState([]); // accumulated results
   const [error, setError] = useState(null);
@@ -121,19 +126,17 @@ export default function App() {
         continue;
       }
 
-      // Poll until done. Collapse repeated "scraping" status into one log line.
+      // Poll until Firecrawl says it's done (or user cancels). No hard timeout —
+      // we trust Firecrawl's expiresAt field as the real expiry.
       setPhase('polling');
-      const pollStart = Date.now();
       let final = null;
       let polls = 0;
       let lastStatus = null;
       let scrapingRunStart = 0;
+      let lastChangeAt = Date.now();
+      let stuckWarned = false;
+
       while (!cancelRef.current) {
-        const elapsed = Date.now() - pollStart;
-        if (elapsed > POLL_TIMEOUT_MS) {
-          pushLog(`  ⏱ Poll timeout after ${POLL_TIMEOUT_MS / 1000}s. Firecrawl job ${jobId.slice(0, 8)}… may still be running on their side. Check https://www.firecrawl.dev/app to verify.`);
-          break;
-        }
         await sleep(POLL_INTERVAL_MS);
         polls += 1;
         setPollCount(polls);
@@ -141,24 +144,30 @@ export default function App() {
           const res = await fetch(`/api/scrape-poll?id=${encodeURIComponent(jobId)}`);
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+          setLastPoll(data);  // expose full poll response to UI
 
-          // Only log when status actually changes (not every poll).
+          // Detect status change → log meaningful event.
           if (data.status !== lastStatus) {
+            lastChangeAt = Date.now();
+            stuckWarned = false;
             if (lastStatus === 'scraping' && data.status !== 'scraping') {
               const dur = ((Date.now() - scrapingRunStart) / 1000).toFixed(1);
-              pushLog(`  · scraping completed in ${dur}s`);
+              pushLog(`  · scraping took ${dur}s · ${data.creditsUsed || 0} credits`);
             }
             if (data.status === 'scraping') {
               scrapingRunStart = Date.now();
-              pushLog(`  · Firecrawl status → scraping (browser session running on their side)`);
+              pushLog(`  · Firecrawl: scraping started${data.expiresAt ? ` · expires ${new Date(data.expiresAt).toLocaleTimeString()}` : ''}`);
             } else if (data.status === 'completed') {
-              pushLog(`  · Firecrawl status → completed${data.creditsUsed ? ` · ${data.creditsUsed} credits charged` : ''}`);
+              pushLog(`  · Firecrawl: completed · ${data.creditsUsed || 0} credits · page_kind=${data.page_kind || '?'} · ${data.filings?.length || 0} filings / ${data.variants?.length || 0} variants${data.total_matched ? ` · "${data.total_matched}"` : ''}`);
             } else if (data.status === 'failed') {
-              pushLog(`  ✗ Firecrawl status → failed${data.error ? `: ${data.error}` : ''}`);
+              pushLog(`  ✗ Firecrawl: failed${data.error ? ` — ${data.error}` : ''}`);
             } else {
               pushLog(`  · status: ${data.status}`);
             }
             lastStatus = data.status;
+          } else if (data.status === 'scraping' && !stuckWarned && Date.now() - lastChangeAt > STUCK_WARN_MS) {
+            pushLog(`  ⚠ ${Math.floor(STUCK_WARN_MS / 1000)}s with no change — job may be slow or stuck. Click "Stop after current lender" to skip.`);
+            stuckWarned = true;
           }
 
           if (data.status === 'completed' || data.status === 'failed') { final = data; break; }
@@ -177,13 +186,18 @@ export default function App() {
           variants: final.variants || [],
           filings: final.filings || [],
           creditsUsed: final.creditsUsed,
+          finalUrl: final.finalUrl,
+          markdownSnippet: final.markdownSnippet,
+          markdownLength: final.markdownLength,
+          pageTitle: final.pageTitle,
+          firecrawlError: final.error,
           elapsedMs,
         };
         results.push(r);
         setPerLender([...results]);
         pushLog(`  ✓ ${r.page_kind || final.status}: ${r.variants.length} variants, ${r.filings.length} filings (${(elapsedMs / 1000).toFixed(1)}s)`);
       } else {
-        results.push({ lender, status: 'error', error: 'timeout or cancelled', variants: [], filings: [], elapsedMs });
+        results.push({ lender, status: 'error', error: 'cancelled', variants: [], filings: [], elapsedMs });
         setPerLender([...results]);
       }
     }
@@ -353,11 +367,17 @@ export default function App() {
           </div>
           <div className="muted small-text">
             Phase: <code>{phase}</code>
-            {currentJobId && <> · Job <code>{currentJobId.slice(0, 12)}…</code></>}
+            {currentJobId && <> · Firecrawl job <code>{currentJobId}</code></>}
+            {lastPoll?.expiresAt && <> · Firecrawl expires {new Date(lastPoll.expiresAt).toLocaleTimeString()}</>}
             <br/>
-            Firecrawl runs login → search → drill in a real browser on their side. The job status stays "scraping" until <em>everything</em> completes (Firecrawl doesn't expose intermediate steps over the API).
+            <strong>No client-side timeout.</strong> We poll for as long as Firecrawl says the job is alive. Cancel manually if you want to stop.
+            {lastPoll?.status === 'scraping' && lenderElapsed > 90 && (
+              <span style={{ color: '#d29922' }}>
+                {' '}· This run is taking longer than usual (Firecrawl's typical: 30–60s).
+              </span>
+            )}
             <br/>
-            Typical: 30–60s per lender. Patient for up to 3 minutes before timing out.
+            Firecrawl runs login → search → drill in a real browser on their side. The job status stays "scraping" until <em>everything</em> completes — they don't expose intermediate steps over their API.
           </div>
         </div>
       )}
@@ -402,7 +422,7 @@ export default function App() {
         <details className="panel" open>
           <summary><strong>Per-lender results ({perLender.length})</strong></summary>
           <table className="compact">
-            <thead><tr><th>#</th><th>Lender</th><th>Page kind</th><th>Total matched</th><th>Variants</th><th>Filings</th><th>Credits</th><th>Elapsed</th><th>Error</th></tr></thead>
+            <thead><tr><th>#</th><th>Lender</th><th>Page kind</th><th>Total matched</th><th>Variants</th><th>Filings</th><th>Credits</th><th>Elapsed</th><th>Final URL</th><th>Error</th></tr></thead>
             <tbody>
               {perLender.map((q, i) => (
                 <tr key={i}>
@@ -414,11 +434,29 @@ export default function App() {
                   <td>{q.filings?.length || 0}</td>
                   <td className="muted">{q.creditsUsed || '–'}</td>
                   <td className="muted">{((q.elapsedMs || 0) / 1000).toFixed(1)}s</td>
-                  <td className="muted">{q.error || ''}</td>
+                  <td className="muted small-text" style={{ maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis' }}>{q.finalUrl ? new URL(q.finalUrl).pathname : '–'}</td>
+                  <td className="muted">{q.error || q.firecrawlError || ''}</td>
                 </tr>
               ))}
             </tbody>
           </table>
+        </details>
+      )}
+
+      {perLender.some(q => q.markdownSnippet) && (
+        <details className="panel">
+          <summary><strong>What Firecrawl actually saw</strong> — page content per lender (debug)</summary>
+          {perLender.filter(q => q.markdownSnippet).map((q, i) => (
+            <div key={i} style={{ marginBottom: '1.25rem' }}>
+              <div className="muted small-text">
+                <strong>{q.lender}</strong>
+                {q.pageTitle && <> · title: <em>{q.pageTitle}</em></>}
+                {q.finalUrl && <> · final URL: <code>{q.finalUrl}</code></>}
+                {q.markdownLength != null && <> · full markdown: {q.markdownLength.toLocaleString()} chars</>}
+              </div>
+              <pre className="csv-preview" style={{ maxHeight: '300px' }}>{q.markdownSnippet}</pre>
+            </div>
+          ))}
         </details>
       )}
 

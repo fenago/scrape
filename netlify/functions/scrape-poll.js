@@ -28,9 +28,22 @@ export async function handler(event) {
   }
 
   // Firecrawl batch response shape:
-  //   { status, total, completed, creditsUsed, data: [{ json, metadata }] }
+  //   { status, total, completed, creditsUsed, expiresAt, data: [{ markdown, json, metadata }] }
   const row = Array.isArray(data.data) && data.data.length ? data.data[0] : null;
   const j = row?.json || row?.extract || {};
+  const markdown = row?.markdown || '';
+  // Strip the GSCCCA header/menu garbage from the markdown preview so the
+  // user sees the actual results section, not the image-preload JS.
+  const interesting = (() => {
+    if (!markdown) return '';
+    // Look for the first meaningful marker we know about.
+    const markers = ['SECURED PARTY SEARCH', 'Search Results', 'Variations of the Name', 'records matched', 'no items matching'];
+    for (const m of markers) {
+      const idx = markdown.toLowerCase().indexOf(m.toLowerCase());
+      if (idx >= 0) return markdown.slice(idx, idx + 3000);
+    }
+    return markdown.slice(0, 3000);
+  })();
 
   // Surface Firecrawl's failure reason from the per-URL data array when status=failed.
   let firecrawlError = null;
@@ -46,11 +59,15 @@ export async function handler(event) {
     completed: data.completed,
     total: data.total,
     creditsUsed: data.creditsUsed ?? null,
+    expiresAt: data.expiresAt || null,    // Firecrawl's own expiry — real timeout
     page_kind: j.page_kind || null,
     total_matched: j.total_matched || '',
     variants: Array.isArray(j.variants) ? j.variants : [],
     filings: Array.isArray(j.filings) ? j.filings : [],
     finalUrl: row?.metadata?.sourceURL || row?.metadata?.url || null,
+    markdownSnippet: interesting,
+    markdownLength: markdown.length,
+    pageTitle: row?.metadata?.title || null,
     error: firecrawlError,
     polledAt: new Date().toISOString(),
   });
