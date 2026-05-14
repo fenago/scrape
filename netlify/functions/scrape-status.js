@@ -1,5 +1,5 @@
-// Poll a Firecrawl batch/scrape job and return aggregated leads.
-// The client polls this endpoint every few seconds until status === 'completed'.
+// Poll a Firecrawl /v1/batch/scrape job. Returns per-query status so the UI
+// can show exactly which queries succeeded, failed, or are still running.
 
 export async function handler(event) {
   if (event.httpMethod !== 'GET') return json(405, { error: 'Method not allowed' });
@@ -22,7 +22,6 @@ export async function handler(event) {
   try { data = JSON.parse(raw); } catch {
     return json(502, { error: 'Firecrawl returned non-JSON response', body: raw.slice(0, 500) });
   }
-
   if (!res.ok || data.success === false) {
     return json(res.status || 502, {
       error: data.error || data.message || 'Firecrawl returned an error',
@@ -30,9 +29,10 @@ export async function handler(event) {
     });
   }
 
-  // Firecrawl batch response shape: { status, total, completed, data: [{ json, metadata: { sourceURL } }, ...] }
+  // Build a per-query report: { query, status, leadCount, totalMatched, error }
   const rows = Array.isArray(data.data) ? data.data : [];
-  const leads = [];
+  const perQuery = [];
+  const allLeads = [];
   let filingsCompletedThrough = null;
   const seen = new Set();
 
@@ -41,30 +41,43 @@ export async function handler(event) {
     if (j.filings_completed_through && !filingsCompletedThrough) {
       filingsCompletedThrough = j.filings_completed_through;
     }
-    const sourceQuery = extractTextParam(row.metadata?.sourceURL);
-    for (const lead of j.leads || []) {
-      const key = `${lead.file_number || ''}|${lead.debtor_name || ''}`;
-      if (key === '|' || seen.has(key)) continue;
+    const sourceUrl = row.metadata?.sourceURL || '';
+    const query = extractTextParam(sourceUrl);
+    const leadsForRow = Array.isArray(j.leads) ? j.leads : [];
+    perQuery.push({
+      query,
+      sourceUrl,
+      status: row.metadata?.statusCode === 200 ? 'ok' : `http_${row.metadata?.statusCode || 'unknown'}`,
+      leadCount: leadsForRow.length,
+      totalMatched: j.total_records_matched || '',
+    });
+    for (const lead of leadsForRow) {
+      const key = `${lead.ucc_number || ''}|${lead.debtor_name || ''}|${lead.address || ''}`;
+      if (key === '||' || seen.has(key)) continue;
       seen.add(key);
-      leads.push({
+      allLeads.push({
         debtor_name: lead.debtor_name || '',
-        file_number: lead.file_number || '',
-        filing_date: lead.filing_date || '',
-        filing_type: lead.filing_type || '',
-        secured_party: lead.secured_party || '',
+        ucc_number: lead.ucc_number || '',
+        filing_year: (lead.ucc_number || '').slice(0, 4) || '',
         address: lead.address || '',
-        source_query: sourceQuery,
+        city: lead.city || '',
+        state: lead.state || '',
+        zip: lead.zip || '',
+        status: lead.status || '',
+        source_query: query,
       });
     }
   }
 
   return json(200, {
-    status: data.status,
-    total: data.total,
-    completed: data.completed,
+    status: data.status,                // 'scraping' | 'completed' | 'failed'
+    total: data.total,                  // total queries in batch
+    completed: data.completed,          // queries done so far
     creditsUsed: data.creditsUsed ?? null,
-    leads,
+    perQuery,                           // [{query, status, leadCount, ...}]
+    leads: allLeads,                    // deduped across all queries
     filingsCompletedThrough,
+    polledAt: new Date().toISOString(),
   });
 }
 
@@ -72,7 +85,6 @@ function extractTextParam(u) {
   if (!u) return '';
   try { return new URL(u).searchParams.get('text') || ''; } catch { return ''; }
 }
-
 function json(statusCode, body) {
   return { statusCode, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
 }

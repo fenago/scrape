@@ -1,6 +1,21 @@
-// Submit a batch of FL UCC search URLs to Firecrawl's async batch/scrape endpoint.
-// Returns a job ID instantly (well under Netlify's 10s sync timeout). The client
-// then polls /api/scrape-status?id=<jobId> to retrieve results as they complete.
+// Submit a batch of FL UCC search URLs to Firecrawl's async /v1/batch/scrape.
+// Returns a job ID instantly (under Netlify's 10s sync limit). The client polls
+// /api/scrape-status?id=<jobId> until status === 'completed'.
+//
+// FL UCC site structure (verified live):
+//   - SPA at https://floridaucc.com/search
+//   - Terms of Use modal blocks first visit. Accept by clicking the agreement
+//     checkbox + the contained-primary "Next" button.
+//   - Search form has 4 fields: Search Type, Search Option, Result Set,
+//     Organization Name. The Result Set dropdown is REQUIRED.
+//   - After accepting the modal, we use executeJavascript to click the 3rd
+//     [aria-haspopup="listbox"] button (Result Set), pick the "Standard search
+//     logic" option, then click the search button.
+//   - Result columns: Name | UCC Number | Address | City | State | Zip | Status.
+//   - The UCC Number's first 4 digits are the filing year.
+//   - "Standard search logic" only matches compacted names exactly, so "A"
+//     returns the businesses named exactly "A CORP.", etc. For prefix
+//     browsing the user should supply concrete name fragments via customNames.
 
 const FIRECRAWL_BATCH = 'https://api.firecrawl.dev/v1/batch/scrape';
 
@@ -9,18 +24,23 @@ const LEAD_SCHEMA = {
   properties: {
     leads: {
       type: 'array',
-      description: 'Every UCC filing row visible in the result table, sorted newest first.',
+      description: 'Every row in the Search Results table.',
       items: {
         type: 'object',
         properties: {
-          debtor_name: { type: 'string' },
-          file_number: { type: 'string' },
-          filing_date: { type: 'string', description: 'MM/DD/YYYY' },
-          filing_type: { type: 'string' },
-          secured_party: { type: 'string' },
-          address: { type: 'string' },
+          debtor_name: { type: 'string', description: 'Name column.' },
+          ucc_number:  { type: 'string', description: 'UCC Number column.' },
+          address:     { type: 'string' },
+          city:        { type: 'string' },
+          state:       { type: 'string' },
+          zip:         { type: 'string', description: 'Zip Code column.' },
+          status:      { type: 'string', description: 'e.g. FILED, LAPSED.' },
         },
       },
+    },
+    total_records_matched: {
+      type: 'string',
+      description: 'The "N records matched this search" footer text.',
     },
     filings_completed_through: { type: 'string' },
   },
@@ -30,8 +50,6 @@ const SEARCH_TYPE_MAP = {
   debtor: { searchOptionType: 'OrganizationDebtorName', searchOptionSubOption: 'FiledCompactDebtorNameList' },
   lender: { searchOptionType: 'SecuredPartyName',       searchOptionSubOption: 'FiledCompactSecuredPartyNameList' },
 };
-
-const PREFIXES_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.split('');
 
 export async function handler(event) {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
@@ -44,18 +62,14 @@ export async function handler(event) {
   const searchType = SEARCH_TYPE_MAP[body.searchType] ? body.searchType : 'debtor';
   const matchMode = body.matchMode === 'Exact' ? 'Exact' : 'BeginsWith';
 
-  // Build query list: explicit `prefixes` array, or `sweep: true` for A-Z + 0-9,
-  // or `customNames` for free-form lender names / prefixes.
   let prefixes = [];
   if (Array.isArray(body.prefixes)) prefixes.push(...body.prefixes);
-  if (body.sweep) prefixes.push(...PREFIXES_ALPHABET);
   if (Array.isArray(body.customNames)) prefixes.push(...body.customNames);
   prefixes = [...new Set(prefixes.map(p => (p || '').trim()).filter(Boolean))];
 
-  // Hard cap on number of queries to limit Firecrawl spend.
-  const maxQueries = clamp(parseInt(body.maxQueries, 10) || 36, 1, 50);
+  const maxQueries = clamp(parseInt(body.maxQueries, 10) || 25, 1, 50);
   if (prefixes.length > maxQueries) prefixes = prefixes.slice(0, maxQueries);
-  if (!prefixes.length) return json(400, { error: 'No prefixes provided' });
+  if (!prefixes.length) return json(400, { error: 'No queries provided. Pick lenders or enter custom names.' });
 
   const cfg = SEARCH_TYPE_MAP[searchType];
   const urls = prefixes.map(p =>
@@ -72,21 +86,39 @@ export async function handler(event) {
     jsonOptions: {
       schema: LEAD_SCHEMA,
       prompt:
-        'Extract every visible UCC filing row from the results list. Each row should ' +
-        'have debtor name, file number, filing date (MM/DD/YYYY), filing type, secured ' +
-        'party, and address if shown. Also capture the "UCC Filings Completed Through" ' +
-        'header date. If only the search form or a Terms of Use modal is visible (no ' +
-        'result rows), return an empty leads array.',
+        'Extract every row from the "Search Results" table. Each row has columns: ' +
+        'Name, UCC Number, Address, City, State, Zip Code, Status. Also capture the ' +
+        '"N records matched this search" footer text and the "UCC Filings Completed ' +
+        'Through" date from the page header. If only the search form is visible and ' +
+        'no result rows are present, return an empty leads array.',
     },
     onlyMainContent: false,
-    waitFor: 3000,
-    timeout: 90000,
+    waitFor: 2000,
+    timeout: 120000,
     actions: [
+      // 1. Accept the Terms of Use modal.
       { type: 'wait', milliseconds: 2500 },
       { type: 'click', selector: 'input[type="checkbox"]' },
       { type: 'wait', milliseconds: 500 },
       { type: 'click', selector: 'button.MuiButton-contained' },
-      { type: 'wait', milliseconds: 5000 },
+      { type: 'wait', milliseconds: 2500 },
+      // 2. Click the "Result Set" dropdown (3rd dropdown on the form).
+      { type: 'executeJavascript', script:
+        "const b=document.querySelectorAll('button[aria-haspopup=\"listbox\"]');" +
+        "if(b[2])b[2].click();"
+      },
+      { type: 'wait', milliseconds: 800 },
+      // 3. Pick the "Standard search logic" option.
+      { type: 'executeJavascript', script:
+        "const o=Array.from(document.querySelectorAll('[role=\"option\"]'));" +
+        "const t=o.find(x=>(x.textContent||'').toLowerCase().includes('standard'));" +
+        "if(t)t.click();"
+      },
+      { type: 'wait', milliseconds: 800 },
+      // 4. Submit the search (magnifying glass next to the text input).
+      { type: 'click', selector: 'button[aria-label="search"]' },
+      // 5. Wait for results table to render.
+      { type: 'wait', milliseconds: 7000 },
     ],
   };
 
@@ -106,7 +138,6 @@ export async function handler(event) {
   try { data = JSON.parse(raw); } catch {
     return json(502, { error: 'Firecrawl returned non-JSON response', body: raw.slice(0, 500) });
   }
-
   if (!res.ok || data.success === false) {
     return json(res.status || 502, {
       error: data.error || data.message || 'Firecrawl returned an error',
@@ -119,9 +150,10 @@ export async function handler(event) {
     jobId: data.id,
     statusUrl: data.url,
     totalQueries: prefixes.length,
-    prefixes,
+    queries: prefixes.map((p, i) => ({ query: p, url: urls[i] })),
     searchType,
     matchMode,
+    submittedAt: new Date().toISOString(),
   });
 }
 

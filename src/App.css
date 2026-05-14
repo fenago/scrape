@@ -208,6 +208,38 @@ tr:hover td { background: rgba(47, 129, 247, 0.05); }
 .errors ul { margin: 0; padding-left: 1.25rem; font-size: 0.85rem; }
 .errors code { background: rgba(0,0,0,0.3); padding: 1px 5px; border-radius: 3px; }
 
+.live-status { padding: 1rem 1.25rem; }
+.live-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 0.75rem; }
+@media (max-width: 640px) { .live-row { grid-template-columns: 1fr 1fr; } }
+.big-num { font-size: 1.6rem; font-weight: 600; color: var(--text); line-height: 1.1; }
+.big-num .small { font-size: 0.9rem; color: var(--muted); font-weight: 400; margin-left: 2px; }
+.big-num code { background: rgba(255,255,255,0.05); padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; }
+.big-label { font-size: 0.7rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.05em; margin-top: 4px; }
+.small-text { font-size: 0.78rem; }
+
+details > summary { cursor: pointer; padding: 0.25rem 0; }
+details[open] > summary { margin-bottom: 0.75rem; }
+
+table.compact th, table.compact td { padding: 0.4rem 0.6rem; font-size: 0.82rem; }
+
+.log { list-style: none; padding: 0; margin: 0; max-height: 300px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 0.78rem; }
+.log li { padding: 0.2rem 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+.log li:last-child { border-bottom: none; }
+
+.csv-tabs { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.csv-preview {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  overflow-x: auto;
+  max-height: 340px;
+  margin: 0;
+  white-space: pre;
+}
+
 footer {
   margin-top: 3rem;
   color: var(--muted);
