@@ -38,6 +38,7 @@ export async function handler(event) {
   const toDate = body.toDate || todayMMDDYYYY();
   const maxrows = clamp(parseInt(body.maxrows, 10) || 100, 10, 100);
   const stemSearch = body.stemSearch !== false; // default true (fuzzy)
+  const debug = body.debug === true;
 
   // Step 1: log in once.
   let cookie;
@@ -48,19 +49,34 @@ export async function handler(event) {
   }
   if (!cookie) return json(502, { error: 'Login produced no session cookie (bad creds?)' });
 
+  // Step 1.5: visit the Secured Party Search form page to establish session
+  // state (the ASP backend may rely on Session() vars set by the page-load
+  // sequence — TurnSPIndOff etc — so a cold POST may be rejected).
+  try {
+    await fetchWithTimeout(
+      'https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty',
+      { method: 'GET', headers: { Cookie: cookie, 'User-Agent': 'Mozilla/5.0' } },
+      PER_QUERY_TIMEOUT_MS
+    );
+  } catch { /* non-fatal */ }
+
   // Step 2: search all lenders in parallel.
   const perQuery = await Promise.all(lenders.map(async (lender) => {
     const t0 = Date.now();
     try {
-      const { html, status } = await searchLender(cookie, lender, fromDate, toDate, maxrows, stemSearch);
+      const { html, status, finalUrl } = await searchLender(cookie, lender, fromDate, toDate, maxrows, stemSearch);
       const parsed = parseResults(html);
       return {
         lender,
         httpStatus: status,
         leadCount: parsed.leads.length,
         totalMatched: parsed.totalMatched,
+        finalUrl,
         leads: parsed.leads.map(l => ({ ...l, source_lender: lender })),
         elapsedMs: Date.now() - t0,
+        // When debug=true, ship the first 4 KB of the raw HTML so we can see
+        // exactly what GSCCCA tells the function.
+        debugHtml: debug ? html.slice(0, 4000) : undefined,
       };
     } catch (err) {
       return {
@@ -143,7 +159,7 @@ async function searchLender(cookie, lender, fromDate, toDate, maxrows, stemSearc
   }, PER_QUERY_TIMEOUT_MS);
 
   const html = await res.text();
-  return { html, status: res.status };
+  return { html, status: res.status, finalUrl: res.url };
 }
 
 // Parse the GA results page. Handles three cases:

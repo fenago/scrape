@@ -60,6 +60,7 @@ export default function App() {
   const [timeWindow, setTimeWindow] = useState('1y');
   const [stemSearch, setStemSearch] = useState(true);
   const [maxrows, setMaxrows] = useState(100);
+  const [debug, setDebug] = useState(false);
   const [selectedLenders, setSelectedLenders] = useState([...DEFAULT_LENDERS]);
   const [customNames, setCustomNames] = useState('');
   const [csvPreview, setCsvPreview] = useState('raw');
@@ -94,7 +95,7 @@ export default function App() {
       const res = await fetch('/api/scrape-ga', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lenders, fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch }),
+        body: JSON.stringify({ lenders, fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch, debug }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -161,6 +162,16 @@ export default function App() {
             <button type="button" className={`chip ${!stemSearch ? 'on' : ''}`} onClick={() => setStemSearch(false)}>Exact</button>
           </div>
           <p className="hint">Stem catches "KABBAGE", "KABBAGE INC", "KABBAGE FUNDING LLC" with one query.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Debug mode</legend>
+          <div className="chips">
+            <button type="button" className={`chip ${debug ? 'on' : ''}`} onClick={() => setDebug(!debug)}>
+              {debug ? 'Debug ON — return raw HTML' : 'Debug OFF'}
+            </button>
+          </div>
+          <p className="hint">Returns the first 4 KB of GSCCCA's raw response for each lender so we can see what the server actually says. Turn on for ONE-lender test runs only.</p>
         </fieldset>
 
         <div className="grid">
@@ -254,6 +265,17 @@ export default function App() {
               ))}
             </tbody>
           </table>
+          {response.perQuery.some(q => q.debugHtml) && (
+            <details style={{ marginTop: '1rem' }}>
+              <summary><strong>Raw HTML response (debug)</strong></summary>
+              {response.perQuery.filter(q => q.debugHtml).map((q, i) => (
+                <div key={i} style={{ marginBottom: '1rem' }}>
+                  <div className="muted small-text">{q.lender} · finalUrl: <code>{q.finalUrl}</code></div>
+                  <pre className="csv-preview" style={{ maxHeight: '400px' }}>{q.debugHtml}</pre>
+                </div>
+              ))}
+            </details>
+          )}
         </details>
       )}
 
