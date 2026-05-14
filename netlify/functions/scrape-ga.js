@@ -146,39 +146,37 @@ async function searchLender(cookie, lender, fromDate, toDate, maxrows, stemSearc
   return { html, status: res.status };
 }
 
-// Parse the GA results page. The first time we see the actual HTML in
-// production, this may need to be tightened. For now we use a flexible
-// table-scan approach: find any <table> whose rows look like result data
-// (≥4 cells, first cell looks like a name/number).
+// Parse the GA results page. Handles three cases:
+//   1. "No items matching your search" → empty leads, totalMatched: "0"
+//   2. A real results table with rows → parsed leads
+//   3. Login expired / error page → throws so the caller surfaces it
 function parseResults(html) {
   const $ = cheerio.load(html);
+  const bodyText = $.root().text().replace(/\s+/g, ' ').trim();
 
-  // Try to find the results table by looking for a header row mentioning
-  // typical UCC columns.
+  // Case 1: explicit no-results message.
+  if (/no\s+items?\s+matching\s+your\s+search/i.test(bodyText) ||
+      /no\s+(?:records?|results?)\s+(?:were\s+)?found/i.test(bodyText)) {
+    return { leads: [], totalMatched: '0' };
+  }
+
+  // Case 3: redirected back to login page = session died.
+  if (/please\s+enter.*login\s+name\s+and\s+password/i.test(bodyText) ||
+      $('input[name="txtUserID"]').length > 0) {
+    throw new Error('GSCCCA session expired or login bounced (page returned login form)');
+  }
+
+  // Case 2: find a real results table. Required signal: a header row that
+  // mentions "debtor" AND ("file" OR "instrument" OR "date").
   let resultsTable = null;
   $('table').each((i, t) => {
-    const headers = $(t).find('th, td').first().parent().find('th, td').map((j, c) => $(c).text().trim().toLowerCase()).get();
+    const headers = $(t).find('tr').first().find('th, td').map((j, c) => $(c).text().trim().toLowerCase()).get();
     const joined = headers.join(' ');
-    if (
-      (joined.includes('debtor') || joined.includes('name')) &&
-      (joined.includes('file') || joined.includes('ucc') || joined.includes('document') || joined.includes('date'))
-    ) {
+    if (joined.includes('debtor') && /\b(file|instrument|date|document)\b/.test(joined)) {
       resultsTable = $(t);
-      return false; // break
+      return false;
     }
   });
-
-  // Fallback: largest table with >2 rows of data
-  if (!resultsTable) {
-    let bestCount = 0;
-    $('table').each((i, t) => {
-      const rowCount = $(t).find('tr').length;
-      if (rowCount > bestCount && rowCount >= 3) {
-        bestCount = rowCount;
-        resultsTable = $(t);
-      }
-    });
-  }
 
   const leads = [];
   if (resultsTable) {
@@ -192,16 +190,12 @@ function parseResults(html) {
     };
     const idx = {
       debtor:      colIdx('debtor', 'name'),
-      file_number: colIdx('file', 'document', 'ucc'),
+      file_number: colIdx('file', 'document', 'instrument'),
       filing_date: colIdx('date'),
-      filing_type: colIdx('type', 'instrument'),
+      filing_type: colIdx('type'),
       secured:     colIdx('secured', 'party'),
       county:      colIdx('county'),
       status:      colIdx('status'),
-      address:     colIdx('address'),
-      city:        colIdx('city'),
-      state:       colIdx('state'),
-      zip:         colIdx('zip', 'postal'),
     };
 
     resultsTable.find('tr').slice(1).each((i, row) => {
@@ -216,20 +210,19 @@ function parseResults(html) {
         secured_party: pick(idx.secured),
         county: pick(idx.county),
         status: pick(idx.status),
-        address: pick(idx.address),
-        city: pick(idx.city),
-        state: pick(idx.state),
-        zip: pick(idx.zip),
+        address: '', city: '', state: '', zip: '',
         raw_cells: cells,
       };
-      if (lead.debtor_name || lead.file_number) leads.push(lead);
+      // Skip junk rows (header re-shows, pagination, etc).
+      if (!lead.debtor_name || lead.debtor_name.length < 2) return;
+      if (/^\s*query\s+made/i.test(lead.debtor_name)) return;
+      if (/^\s*display\s+results/i.test(lead.debtor_name)) return;
+      leads.push(lead);
     });
   }
 
-  // Try to extract "N records matched" text from the body.
-  const bodyText = $.root().text();
-  const totalMatch = bodyText.match(/(\d+(?:,\d{3})*)\s+(?:records?|results?)\s+(?:matched|found)/i);
-  const totalMatched = totalMatch ? totalMatch[1] : '';
+  const totalMatch = bodyText.match(/(\d+(?:,\d{3})*)\s+(?:records?|results?|items?)\s+(?:matched|found)/i);
+  const totalMatched = totalMatch ? totalMatch[1] : (leads.length ? String(leads.length) : '');
 
   return { leads, totalMatched };
 }

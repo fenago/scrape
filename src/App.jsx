@@ -38,7 +38,11 @@ const MCA_LENDERS = [
   'EXPANSION CAPITAL',
 ];
 
-const DEFAULT_LENDERS = ['CELTIC BANK', 'WEBBANK', 'KABBAGE', 'ON DECK CAPITAL', 'BLUEVINE'];
+// Highest-volume GA UCC filers in the MCA space (verified high hit-rate).
+// Celtic Bank + WebBank originate loans for dozens of fintech MCAs each.
+// Amex National Bank is post-acquisition Kabbage and most current Amex Business
+// Blueprint loans.
+const DEFAULT_LENDERS = ['CELTIC BANK', 'WEBBANK', 'AMERICAN EXPRESS NATIONAL BANK', 'ON DECK CAPITAL', 'KAPITUS'];
 
 const TIME_WINDOWS = [
   { id: '7d',  label: 'Last 7 days',  days: 7 },
@@ -53,7 +57,7 @@ function mmddyyyy(date) {
 }
 
 export default function App() {
-  const [timeWindow, setTimeWindow] = useState('30d');
+  const [timeWindow, setTimeWindow] = useState('1y');
   const [stemSearch, setStemSearch] = useState(true);
   const [maxrows, setMaxrows] = useState(100);
   const [selectedLenders, setSelectedLenders] = useState([...DEFAULT_LENDERS]);
