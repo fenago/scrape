@@ -20,8 +20,8 @@ const TIME_WINDOWS = [
   { id: '365d', label: 'Last 12 months (max for free account)', days: 365 },
 ];
 
-const POLL_INTERVAL_MS = 2500;
-const POLL_TIMEOUT_MS = 90000;
+const POLL_INTERVAL_MS = 3000;
+const POLL_TIMEOUT_MS = 180000; // 3 min — Firecrawl batch jobs queue + run; be patient.
 
 function mmddyyyy(d) { return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`; }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -121,14 +121,17 @@ export default function App() {
         continue;
       }
 
-      // Poll until done.
+      // Poll until done. Collapse repeated "scraping" status into one log line.
       setPhase('polling');
       const pollStart = Date.now();
       let final = null;
       let polls = 0;
+      let lastStatus = null;
+      let scrapingRunStart = 0;
       while (!cancelRef.current) {
-        if (Date.now() - pollStart > POLL_TIMEOUT_MS) {
-          pushLog(`  ✗ Poll timeout after ${POLL_TIMEOUT_MS / 1000}s`);
+        const elapsed = Date.now() - pollStart;
+        if (elapsed > POLL_TIMEOUT_MS) {
+          pushLog(`  ⏱ Poll timeout after ${POLL_TIMEOUT_MS / 1000}s. Firecrawl job ${jobId.slice(0, 8)}… may still be running on their side. Check https://www.firecrawl.dev/app to verify.`);
           break;
         }
         await sleep(POLL_INTERVAL_MS);
@@ -138,7 +141,26 @@ export default function App() {
           const res = await fetch(`/api/scrape-poll?id=${encodeURIComponent(jobId)}`);
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-          pushLog(`  poll #${polls}: status=${data.status}${data.creditsUsed ? ` · ${data.creditsUsed} credits` : ''}`);
+
+          // Only log when status actually changes (not every poll).
+          if (data.status !== lastStatus) {
+            if (lastStatus === 'scraping' && data.status !== 'scraping') {
+              const dur = ((Date.now() - scrapingRunStart) / 1000).toFixed(1);
+              pushLog(`  · scraping completed in ${dur}s`);
+            }
+            if (data.status === 'scraping') {
+              scrapingRunStart = Date.now();
+              pushLog(`  · Firecrawl status → scraping (browser session running on their side)`);
+            } else if (data.status === 'completed') {
+              pushLog(`  · Firecrawl status → completed${data.creditsUsed ? ` · ${data.creditsUsed} credits charged` : ''}`);
+            } else if (data.status === 'failed') {
+              pushLog(`  ✗ Firecrawl status → failed${data.error ? `: ${data.error}` : ''}`);
+            } else {
+              pushLog(`  · status: ${data.status}`);
+            }
+            lastStatus = data.status;
+          }
+
           if (data.status === 'completed' || data.status === 'failed') { final = data; break; }
         } catch (err) {
           pushLog(`  ✗ Poll error: ${err.message}`);
@@ -333,8 +355,9 @@ export default function App() {
             Phase: <code>{phase}</code>
             {currentJobId && <> · Job <code>{currentJobId.slice(0, 12)}…</code></>}
             <br/>
-            Steps: Firecrawl logs in → submits search → drills into biggest variant → AI-extracts the filings.
-            Each lender ≈ 25–40 seconds. Live log below ⬇
+            Firecrawl runs login → search → drill in a real browser on their side. The job status stays "scraping" until <em>everything</em> completes (Firecrawl doesn't expose intermediate steps over the API).
+            <br/>
+            Typical: 30–60s per lender. Patient for up to 3 minutes before timing out.
           </div>
         </div>
       )}

@@ -32,6 +32,15 @@ export async function handler(event) {
   const row = Array.isArray(data.data) && data.data.length ? data.data[0] : null;
   const j = row?.json || row?.extract || {};
 
+  // Surface Firecrawl's failure reason from the per-URL data array when status=failed.
+  let firecrawlError = null;
+  if (data.status === 'failed') {
+    firecrawlError =
+      data.error || data.message ||
+      row?.error || row?.metadata?.error ||
+      'Firecrawl reported failed status (no error message).';
+  }
+
   return json(200, {
     status: data.status,                  // 'scraping' | 'completed' | 'failed'
     completed: data.completed,
@@ -41,6 +50,8 @@ export async function handler(event) {
     total_matched: j.total_matched || '',
     variants: Array.isArray(j.variants) ? j.variants : [],
     filings: Array.isArray(j.filings) ? j.filings : [],
+    finalUrl: row?.metadata?.sourceURL || row?.metadata?.url || null,
+    error: firecrawlError,
     polledAt: new Date().toISOString(),
   });
 }

@@ -121,21 +121,21 @@ export async function handler(event) {
     waitFor: 1000,
     timeout: 90000,
     actions: [
-      { type: 'wait', milliseconds: 1500 },
+      { type: 'wait', milliseconds: 1000 },
       { type: 'executeJavascript', script:
         `document.frmLogin.txtUserID.value=${JSON.stringify(user)};` +
         `document.frmLogin.txtPassword.value=${JSON.stringify(pass)};` +
         "document.frmLogin.submit();"
       },
-      { type: 'wait', milliseconds: 4500 },
+      { type: 'wait', milliseconds: 3000 },
       { type: 'executeJavascript', script:
         "window.location.href='https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty';"
       },
-      { type: 'wait', milliseconds: 4500 },
+      { type: 'wait', milliseconds: 3000 },
       { type: 'executeJavascript', script: fillSearchFormJs },
-      { type: 'wait', milliseconds: 6000 },
+      { type: 'wait', milliseconds: 4500 },
       { type: 'executeJavascript', script: drillJs },
-      { type: 'wait', milliseconds: 6000 },
+      { type: 'wait', milliseconds: 4500 },
     ],
   };
 
