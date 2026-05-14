@@ -61,6 +61,8 @@ export async function handler(event) {
 
   const searchType = SEARCH_TYPE_MAP[body.searchType] ? body.searchType : 'debtor';
   const matchMode = body.matchMode === 'Exact' ? 'Exact' : 'BeginsWith';
+  const searchLogic = body.searchLogic === 'standard' ? 'standard' : 'proximity';
+  const logicNeedle = searchLogic === 'standard' ? 'standard' : 'proximity';
 
   let prefixes = [];
   if (Array.isArray(body.prefixes)) prefixes.push(...body.prefixes);
@@ -108,10 +110,10 @@ export async function handler(event) {
         "if(b[2])b[2].click();"
       },
       { type: 'wait', milliseconds: 800 },
-      // 3. Pick the "Standard search logic" option.
+      // 3. Pick the search logic option (Proximity or Standard).
       { type: 'executeJavascript', script:
         "const o=Array.from(document.querySelectorAll('[role=\"option\"]'));" +
-        "const t=o.find(x=>(x.textContent||'').toLowerCase().includes('standard'));" +
+        `const t=o.find(x=>(x.textContent||'').toLowerCase().includes('${logicNeedle}'));` +
         "if(t)t.click();"
       },
       { type: 'wait', milliseconds: 800 },

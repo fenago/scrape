@@ -1,10 +1,53 @@
 import { useEffect, useRef, useState } from 'react';
 
+// Real MCA UCC filing entities. These are the names lenders actually file
+// under in FL (legal entities + the banks that originate their loans), not
+// the consumer brand names. Curated from public UCC filings against US
+// small businesses.
 const MCA_LENDERS = [
-  'KABBAGE', 'ONDECK', 'BLUEVINE', 'SQUARE CAPITAL', 'FUNDING CIRCLE',
-  'PAYPAL WORKING CAPITAL', 'AMERICAN EXPRESS MERCHANT FINANCING',
-  'SHOPIFY CAPITAL', 'FUNDBOX', 'LENDIO', 'CAN CAPITAL', 'RAPID FINANCE',
-  'CREDIBLY', 'CELTIC BANK', 'WEBBANK', 'WORLD BUSINESS LENDERS',
+  // Banks that originate loans for many MCA brands (highest hit rate):
+  'CELTIC BANK CORPORATION',
+  'WEBBANK',
+  'CROSS RIVER BANK',
+  'AMERICAN EXPRESS NATIONAL BANK',
+  // Direct MCA lender legal entities:
+  'KABBAGE INC',
+  'KABBAGE FUNDING LLC',
+  'ON DECK CAPITAL INC',
+  'BLUEVINE CAPITAL INC',
+  'FUNDING CIRCLE',
+  'FUNDING CIRCLE NOTES PROGRAM',
+  'SQUARE FINANCIAL SERVICES INC',
+  'FUNDBOX INC',
+  'SHOPIFY CAPITAL INC',
+  'CAN CAPITAL',
+  'RAPID FINANCIAL SERVICES',
+  'CREDIBLY',
+  'WORLD BUSINESS LENDERS',
+  'WORLD GLOBAL CAPITAL',
+  'PEARL CAPITAL',
+  'PEARL BETA FUNDING',
+  'EVEREST BUSINESS FUNDING',
+  'EBF PARTNERS',
+  'MULLIGAN FUNDING',
+  'QUICKBRIDGE',
+  'STRATEGIC FUNDING SOURCE',
+  'IOU FINANCIAL',
+  'GREEN CAPITAL FUNDING',
+  'BIZFUND',
+  'FOX CAPITAL GROUP',
+  'LENDISTRY',
+  'LENDR',
+];
+
+// Default pre-selection: 5 highest-hit-rate entities, so a first batch costs
+// ~25 credits and validates the flow before a full sweep.
+const DEFAULT_LENDERS = [
+  'CELTIC BANK CORPORATION',
+  'WEBBANK',
+  'AMERICAN EXPRESS NATIONAL BANK',
+  'KABBAGE INC',
+  'ON DECK CAPITAL INC',
 ];
 
 const YEAR_OPTIONS = [
@@ -20,8 +63,9 @@ export default function App() {
   const [yearFilter, setYearFilter] = useState('all');
   const [maxQueries, setMaxQueries] = useState(16);
   const [leadCap, setLeadCap] = useState(500);
-  const [selectedLenders, setSelectedLenders] = useState([...MCA_LENDERS]);
+  const [selectedLenders, setSelectedLenders] = useState([...DEFAULT_LENDERS]);
   const [customNames, setCustomNames] = useState('');
+  const [searchLogic, setSearchLogic] = useState('proximity'); // 'standard' | 'proximity'
   const [csvPreview, setCsvPreview] = useState('raw'); // 'raw' | 'ghl'
 
   const [job, setJob] = useState(null);                     // {jobId, totalQueries, queries:[{query,url}]}
@@ -52,6 +96,7 @@ export default function App() {
     const submitBody = {
       searchType: mode,
       matchMode: 'BeginsWith',
+      searchLogic,                              // 'standard' | 'proximity'
       maxQueries: parseInt(maxQueries, 10) || 16,
       customNames: customs,
     };
@@ -212,6 +257,18 @@ export default function App() {
         </fieldset>
 
         <fieldset>
+          <legend>Search logic (how FL UCC matches names)</legend>
+          <div className="chips">
+            <button type="button" className={`chip ${searchLogic === 'proximity' ? 'on' : ''}`} onClick={() => setSearchLogic('proximity')}>Proximity (fuzzy, recommended)</button>
+            <button type="button" className={`chip ${searchLogic === 'standard' ? 'on' : ''}`} onClick={() => setSearchLogic('standard')}>Standard (exact compacted name)</button>
+          </div>
+          <p className="hint">
+            Standard = FL's "Compact Name" — strips INC/LLC/CORP then exact-matches. Returns nothing for slight name variations.<br/>
+            Proximity = fuzzy match that catches variants ("KABBAGE", "KABBAGE INC", "KABBAGE FUNDING LLC" all hit one query).
+          </p>
+        </fieldset>
+
+        <fieldset>
           <legend>Filing year (filter applied to results)</legend>
           <div className="chips">
             {YEAR_OPTIONS.map(t => (
@@ -240,7 +297,10 @@ export default function App() {
 
         {mode === 'lender' && (
           <fieldset>
-            <legend>MCA lenders (click to toggle — currently {selectedLenders.length} selected)</legend>
+            <legend>MCA filing entities ({selectedLenders.length} of {MCA_LENDERS.length} selected)</legend>
+            <p className="hint">
+              These are the <strong>legal entities</strong> MCA lenders actually file UCCs under in FL — not the consumer brand names. Banks like <em>Celtic Bank</em>, <em>WebBank</em>, <em>Cross River Bank</em> originate loans for many MCA brands; they have the highest hit rate. {DEFAULT_LENDERS.length} are pre-selected for a cheap first run.
+            </p>
             <div className="chips">
               {MCA_LENDERS.map(l => (
                 <button key={l} type="button"
@@ -250,6 +310,7 @@ export default function App() {
             </div>
             <div className="actions">
               <button type="button" className="link" onClick={() => setSelectedLenders([...MCA_LENDERS])}>Select all</button>
+              <button type="button" className="link" onClick={() => setSelectedLenders([...DEFAULT_LENDERS])}>Reset to defaults</button>
               <button type="button" className="link" onClick={() => setSelectedLenders([])}>Clear</button>
             </div>
           </fieldset>
