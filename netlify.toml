@@ -9,8 +9,13 @@
   targetPort = 5173
 
 [[redirects]]
-  from = "/api/scrape-ga-one"
-  to = "/.netlify/functions/scrape-ga-one"
+  from = "/api/scrape-start"
+  to = "/.netlify/functions/scrape-start"
+  status = 200
+
+[[redirects]]
+  from = "/api/scrape-poll"
+  to = "/.netlify/functions/scrape-poll"
   status = 200
 
 [[redirects]]
