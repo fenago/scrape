@@ -67,7 +67,13 @@ export default function App() {
         });
         const data = await res.json();
         if (!res.ok) {
-          errs.push({ query: q, error: data.error || `HTTP ${res.status}` });
+          const detail = data.firecrawl_details
+            ? JSON.stringify(data.firecrawl_details).slice(0, 300)
+            : '';
+          errs.push({
+            query: q,
+            error: `${data.error || `HTTP ${res.status}`}${detail ? ` — ${detail}` : ''}`,
+          });
           continue;
         }
         if (data.filingsCompletedThrough && !filingsThrough) {

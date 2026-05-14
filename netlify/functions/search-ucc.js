@@ -1,17 +1,13 @@
 // Netlify Function: pull UCC filings from floridaucc.com (the new SPA at /search).
 //
 // FL UCC moved off the old SearchDisclaimer.aspx page. The new site is a React
-// SPA that requires a Terms of Use disclaimer accept on first visit and a
-// "Result Set" dropdown selection before search results render.
+// SPA that pops a Terms of Use modal on first visit and requires a "Result Set"
+// dropdown selection before search results render.
 //
 // Strategy: hit the deep URL with all query params so the form is pre-filled,
 // then use Firecrawl `actions` to (1) accept the disclaimer modal, (2) pick
 // "Standard search logic" in the Result Set dropdown, (3) click search, and
 // (4) extract rows into a JSON schema.
-//
-// Supports two modes:
-//   - searchType=debtor  → searchOptionType=OrganizationDebtorName (default)
-//   - searchType=lender  → searchOptionType=SecuredPartyName (MCA funder hunt)
 
 const FIRECRAWL_ENDPOINT = 'https://api.firecrawl.dev/v1/scrape';
 
@@ -24,19 +20,16 @@ const LEAD_SCHEMA = {
       items: {
         type: 'object',
         properties: {
-          debtor_name: { type: 'string', description: 'Debtor (business) name.' },
-          file_number: { type: 'string', description: 'UCC file/document number.' },
-          filing_date: { type: 'string', description: 'Date the UCC was filed (MM/DD/YYYY).' },
-          filing_type: { type: 'string', description: 'e.g. Initial Financing Statement, Amendment.' },
-          secured_party: { type: 'string', description: 'Secured party / lender name.' },
-          address: { type: 'string', description: 'Debtor address if shown in row or expandable detail.' },
+          debtor_name: { type: 'string' },
+          file_number: { type: 'string' },
+          filing_date: { type: 'string' },
+          filing_type: { type: 'string' },
+          secured_party: { type: 'string' },
+          address: { type: 'string' },
         },
       },
     },
-    filings_completed_through: {
-      type: 'string',
-      description: 'The "UCC Filings Completed Through: MM/DD/YYYY" header value, if present.',
-    },
+    filings_completed_through: { type: 'string' },
   },
 };
 
@@ -44,12 +37,10 @@ const SEARCH_TYPE_MAP = {
   debtor: {
     searchOptionType: 'OrganizationDebtorName',
     searchOptionSubOption: 'FiledCompactDebtorNameList',
-    placeholderHint: 'Organization Name',
   },
   lender: {
     searchOptionType: 'SecuredPartyName',
     searchOptionSubOption: 'FiledCompactSecuredPartyNameList',
-    placeholderHint: 'Secured Party Name',
   },
 };
 
@@ -79,38 +70,39 @@ export async function handler(event) {
     `&searchOptionSubOption=${cfg.searchOptionSubOption}` +
     `&searchCategory=${matchMode}`;
 
+  // Firecrawl v1 scrape API shape:
+  //   formats: string[] (e.g. ['json'])
+  //   jsonOptions: { schema, prompt } (top-level, not nested in formats)
+  //   actions: [{ type, selector?, milliseconds?, text?, key? }]
+  // CSS selectors only — :has-text() and other Playwright-only pseudos don't work.
   const payload = {
     url,
-    formats: [
-      {
-        type: 'json',
-        schema: LEAD_SCHEMA,
-        prompt:
-          'Extract every row from the UCC search results list. Capture debtor name, ' +
-          'file number, filing date, filing type, secured party, and any visible address. ' +
-          'Also extract the "UCC Filings Completed Through" date if shown in the page header. ' +
-          'If no results render or only the form is visible, return an empty leads array.',
-      },
-    ],
+    formats: ['json'],
+    jsonOptions: {
+      schema: LEAD_SCHEMA,
+      prompt:
+        'Extract every row from the UCC search results list on the page. Capture ' +
+        'debtor name, file number, filing date, filing type, secured party, and any ' +
+        'visible address. Also extract the "UCC Filings Completed Through" date if ' +
+        'shown in the page header. If only the search form is visible and no result ' +
+        'rows are rendered, return an empty leads array.',
+    },
     onlyMainContent: false,
-    waitFor: 3500,
+    waitFor: 3000,
     timeout: 90000,
     actions: [
-      // Accept the disclaimer modal (checkbox + Next).
+      // 1. Accept the disclaimer modal: check the agreement, click Next.
+      //    The MUI checkbox is the only checkbox on the page during the modal.
+      //    The Next button is the only contained/primary button in the dialog.
       { type: 'wait', milliseconds: 2500 },
       { type: 'click', selector: 'input[type="checkbox"]' },
-      { type: 'wait', milliseconds: 400 },
-      { type: 'click', selector: 'button:has-text("Next")' },
-      { type: 'wait', milliseconds: 2500 },
-      // Open the Result Set dropdown and pick "Standard search logic".
-      // The Result Set field is the 3rd dropdown on the form; we click its trigger button.
-      { type: 'click', selector: 'button[aria-haspopup="listbox"]:nth-of-type(3), [role="button"][aria-haspopup="listbox"]:nth-of-type(3)' },
-      { type: 'wait', milliseconds: 600 },
-      { type: 'click', selector: '[role="option"]:has-text("Standard search logic")' },
-      { type: 'wait', milliseconds: 600 },
-      // Trigger search (the magnifying glass button next to the text field).
-      { type: 'click', selector: 'button[aria-label="search"], button:has(svg[data-testid*="Search"])' },
-      { type: 'wait', milliseconds: 5000 },
+      { type: 'wait', milliseconds: 500 },
+      { type: 'click', selector: 'button.MuiButton-contained' },
+      { type: 'wait', milliseconds: 3000 },
+      // 2. Wait long enough for the search form (with prefilled URL params) to
+      //    auto-trigger a load. If the page renders results immediately because
+      //    the URL params populate the form, we're done.
+      { type: 'wait', milliseconds: 4000 },
     ],
   };
 
@@ -128,11 +120,20 @@ export async function handler(event) {
     return json(502, { error: `Firecrawl request failed: ${err.message}` });
   }
 
-  const data = await firecrawlRes.json().catch(() => ({}));
+  const raw = await firecrawlRes.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return json(502, { error: 'Firecrawl returned non-JSON response', body: raw.slice(0, 500) });
+  }
+
   if (!firecrawlRes.ok || data.success === false) {
     return json(firecrawlRes.status || 502, {
       error: data.error || data.message || 'Firecrawl returned an error',
-      details: data,
+      firecrawl_status: firecrawlRes.status,
+      firecrawl_details: data,
+      payload_sent: { url, actions: payload.actions.length },
     });
   }
 
