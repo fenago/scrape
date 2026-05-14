@@ -211,14 +211,14 @@ export default function App() {
     cancelRef.current = true;
   }
 
-  // Aggregate + dedupe.
+  // Aggregate + dedupe (on file_number + debtor_name).
   const leads = (() => {
     const seen = new Set();
     const out = [];
     for (const q of perLender) {
       for (const f of (q.filings || [])) {
-        const key = `${f.file_number || ''}|${f.debtor_name || ''}|${f.county || ''}`;
-        if (key === '||' || seen.has(key)) continue;
+        const key = `${f.file_number || ''}|${f.debtor_name || ''}`;
+        if (key === '|' || seen.has(key)) continue;
         seen.add(key);
         out.push({ ...f, source_lender: q.lender });
       }
@@ -227,14 +227,14 @@ export default function App() {
   })();
 
   function rawCsv(rows) {
-    const headers = ['debtor_name', 'file_number', 'filing_date', 'filing_type', 'secured_party', 'county', 'status', 'source_lender'];
+    const headers = ['file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender'];
     return [headers.join(','), ...rows.map(l => headers.map(h => csvCell(l[h])).join(','))].join('\n');
   }
   function ghlCsv(rows) {
     const headers = ['First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address', 'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes'];
     return [headers.join(','), ...rows.map(l => {
-      const tags = ['ucc-ga-lead', l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`, l.county && `county-${l.county.toLowerCase().replace(/\s+/g, '-')}`].filter(Boolean).join('; ');
-      const notes = [`UCC #${l.file_number}`, l.filing_date && `Filed: ${l.filing_date}`, l.filing_type && `Type: ${l.filing_type}`, l.secured_party && `Secured Party: ${l.secured_party}`, l.status && `Status: ${l.status}`].filter(Boolean).join(' | ');
+      const tags = ['ucc-ga-lead', l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`, l.document_type && `doc-${l.document_type.toLowerCase()}`].filter(Boolean).join('; ');
+      const notes = [`UCC #${l.file_number}`, l.date_filed && `Filed: ${l.date_filed}`, l.document_type && `Type: ${l.document_type}`, l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`].filter(Boolean).join(' | ');
       return ['', '', '', '', l.debtor_name, '', '', 'GA', '', 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
     })].join('\n');
   }
@@ -499,18 +499,16 @@ export default function App() {
           <h3>Leads ({leads.length})</h3>
           <table>
             <thead>
-              <tr><th>Debtor</th><th>File #</th><th>Filed</th><th>Type</th><th>Secured Party</th><th>County</th><th>Status</th><th>Source</th></tr>
+              <tr><th>Debtor (Lead)</th><th>File #</th><th>Doc Type</th><th>Date Filed</th><th>Original File #</th><th>Funded By</th></tr>
             </thead>
             <tbody>
               {leads.slice(0, 500).map((l, i) => (
                 <tr key={i}>
-                  <td>{l.debtor_name}</td>
+                  <td><strong>{l.debtor_name}</strong></td>
                   <td><code>{l.file_number}</code></td>
-                  <td>{l.filing_date}</td>
-                  <td>{l.filing_type}</td>
-                  <td>{l.secured_party}</td>
-                  <td>{l.county}</td>
-                  <td>{l.status}</td>
+                  <td>{l.document_type}</td>
+                  <td>{l.date_filed}</td>
+                  <td className="muted">{l.original_file_number}</td>
                   <td className="muted">{l.source_lender}</td>
                 </tr>
               ))}

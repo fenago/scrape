@@ -32,16 +32,17 @@ const LEAD_SCHEMA = {
     },
     filings: {
       type: 'array',
+      description:
+        'When the page shows individual UCC filings (after drilling into a variant) — ' +
+        'GA columns are FILE NUMBER, DOCUMENT TYPE, DEBTOR NAME, DATE FILED, ORIGINAL FILE NUMBER.',
       items: {
         type: 'object',
         properties: {
-          debtor_name: { type: 'string' },
-          file_number: { type: 'string' },
-          filing_date: { type: 'string' },
-          filing_type: { type: 'string' },
-          secured_party: { type: 'string' },
-          county: { type: 'string' },
-          status: { type: 'string' },
+          file_number:          { type: 'string', description: 'Like 007-2025-024314' },
+          document_type:        { type: 'string', description: 'Original / Termination / Continuation / Amendment / etc.' },
+          debtor_name:          { type: 'string', description: 'The actual business name (the lead).' },
+          date_filed:           { type: 'string', description: 'Date filed text from the page.' },
+          original_file_number: { type: 'string', description: 'For non-Original docs, the original file # referenced.' },
         },
       },
     },
@@ -83,22 +84,28 @@ export async function handler(event) {
     "f.submit();"
   );
 
+  // GA's variants page uses: radio button per row + a "Display Details"
+  // button below the table. Verified live via Firecrawl interact session.
+  // Clicking radio + Display Details navigates to occurrences.asp with the
+  // selected variant's actual filings (debtor names, file numbers, etc.).
   const drillJs = (
     "(function(){" +
-      "const rows=Array.from(document.querySelectorAll('tr'));" +
-      "let best=null,bestCount=-1;" +
-      "for(const r of rows){" +
-        "const cells=Array.from(r.querySelectorAll('td')).map(c=>c.textContent.trim());" +
-        "for(const c of cells){" +
-          "const n=parseInt(c.replace(/,/g,''),10);" +
-          "if(!isNaN(n)&&n>0&&n<100000&&n>bestCount){bestCount=n;best=r;break;}" +
+      "let bestRow=null,bestCount=-1;" +
+      "document.querySelectorAll('table tr').forEach(tr=>{" +
+        "const cells=tr.querySelectorAll('td');" +
+        "if(cells.length>=3){" +
+          "const n=parseInt((cells[1].textContent||'').replace(/,/g,'').trim(),10);" +
+          "if(!isNaN(n)&&n>bestCount&&cells[0].querySelector('input[type=radio]')){" +
+            "bestCount=n;bestRow=tr;" +
+          "}" +
         "}" +
-      "}" +
-      "if(best){" +
-        "const link=best.querySelector('a[href*=\"securedresults\"], a[href*=\"Result\"], a[href]');" +
-        "if(link){link.click();return;}" +
-        "const radio=best.querySelector('input[type=\"radio\"]');" +
-        "if(radio){radio.checked=true;const form=radio.form||document.forms[0];if(form){form.submit();return;}}" +
+      "});" +
+      "if(bestRow){" +
+        "const radio=bestRow.querySelector('input[type=radio]');" +
+        "if(radio)radio.checked=true;" +
+        "const btn=Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'))" +
+          ".find(b=>((b.textContent||'')+(b.value||'')).toLowerCase().includes('display details'));" +
+        "if(btn)btn.click();" +
       "}" +
     "})();"
   );
@@ -109,13 +116,14 @@ export async function handler(event) {
     jsonOptions: {
       schema: LEAD_SCHEMA,
       prompt:
-        'GSCCCA Georgia UCC search results. Determine page_kind: ' +
-        '"filings" if individual UCC filings (debtor/file number/date); ' +
-        '"variants" if secured-party NAME variants with counts; ' +
-        '"none" if "no items matching"; "login" if a login form; else "other". ' +
-        'Extract every variant (secured_party_name + instrument_count) AND every filing ' +
-        '(debtor_name, file_number, filing_date, filing_type, secured_party, county, status). ' +
-        'Capture any "N records/variations/instruments" header text into total_matched.',
+        'GSCCCA Georgia UCC results page. Determine page_kind: ' +
+        '"filings" if the table has columns FILE NUMBER, DOCUMENT TYPE, DEBTOR NAME, DATE FILED, ORIGINAL FILE NUMBER ' +
+        '(this is the drilled-into page showing individual UCC filings); ' +
+        '"variants" if columns are SELECT, INSTRUMENTS, SECURED PARTY NAME (the upper-level name-variants page); ' +
+        '"none" if body contains "no items matching"; "login" if a login form is showing; else "other". ' +
+        'For filings: extract every row\'s file_number (format like 007-YYYY-NNNNNN), document_type, debtor_name, date_filed, original_file_number. ' +
+        'For variants: extract secured_party_name + instrument_count per row. ' +
+        'Capture any "N Records Found" / "N Variations of the Name Found" text into total_matched.',
     },
     onlyMainContent: false,
     waitFor: 1000,
