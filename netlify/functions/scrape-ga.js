@@ -74,9 +74,10 @@ export async function handler(event) {
         finalUrl,
         leads: parsed.leads.map(l => ({ ...l, source_lender: lender })),
         elapsedMs: Date.now() - t0,
-        // When debug=true, ship the first 4 KB of the raw HTML so we can see
-        // exactly what GSCCCA tells the function.
-        debugHtml: debug ? html.slice(0, 4000) : undefined,
+        // When debug=true, ship up to 60 KB of raw HTML — enough to capture
+        // the results table or "no items matching" content below the header.
+        debugHtml: debug ? html.slice(0, 60000) : undefined,
+        debugHtmlLength: debug ? html.length : undefined,
       };
     } catch (err) {
       return {
