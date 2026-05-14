@@ -1,265 +1,285 @@
-import { useState } from 'react';
-
-const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.split('');
+import { useEffect, useRef, useState } from 'react';
 
 const MCA_LENDERS = [
-  'KABBAGE',
-  'ONDECK',
-  'BLUEVINE',
-  'SQUARE CAPITAL',
-  'FUNDING CIRCLE',
-  'PAYPAL WORKING CAPITAL',
-  'AMERICAN EXPRESS MERCHANT FINANCING',
-  'SHOPIFY CAPITAL',
-  'FUNDBOX',
-  'LENDIO',
-  'CAN CAPITAL',
-  'RAPID FINANCE',
-  'CREDIBLY',
-  'CELTIC BANK',
-  'WEBBANK',
-  'WORLD BUSINESS LENDERS',
+  'KABBAGE', 'ONDECK', 'BLUEVINE', 'SQUARE CAPITAL', 'FUNDING CIRCLE',
+  'PAYPAL WORKING CAPITAL', 'AMERICAN EXPRESS MERCHANT FINANCING',
+  'SHOPIFY CAPITAL', 'FUNDBOX', 'LENDIO', 'CAN CAPITAL', 'RAPID FINANCE',
+  'CREDIBLY', 'CELTIC BANK', 'WEBBANK', 'WORLD BUSINESS LENDERS',
+];
+
+const TIME_WINDOWS = [
+  { id: 'all',    label: 'All time',     days: null },
+  { id: '24h',    label: 'Last 24 hours', days: 1 },
+  { id: '7d',     label: 'Last 7 days',  days: 7 },
+  { id: '30d',    label: 'Last 30 days', days: 30 },
+  { id: '90d',    label: 'Last 90 days', days: 90 },
 ];
 
 export default function App() {
-  const [mode, setMode] = useState('debtor'); // 'debtor' | 'lender'
-  const [prefixes, setPrefixes] = useState(['A']);
-  const [customPrefix, setCustomPrefix] = useState('');
+  const [mode, setMode] = useState('debtor');           // 'debtor' | 'lender'
+  const [timeWindow, setTimeWindow] = useState('30d');
+  const [maxQueries, setMaxQueries] = useState(36);
+  const [leadCap, setLeadCap] = useState(500);
+  const [selectedLenders, setSelectedLenders] = useState([...MCA_LENDERS]);
+  const [customNames, setCustomNames] = useState('');
+
+  const [job, setJob] = useState(null);                  // {jobId, totalQueries}
+  const [status, setStatus] = useState(null);            // poll response
+  const [error, setError] = useState(null);
   const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState(null);
-  const [leads, setLeads] = useState([]);
-  const [errors, setErrors] = useState([]);
-  const [filingsThrough, setFilingsThrough] = useState(null);
+  const pollTimer = useRef(null);
 
-  function togglePrefix(p) {
-    setPrefixes(curr => (curr.includes(p) ? curr.filter(x => x !== p) : [...curr, p]));
+  useEffect(() => () => clearTimeout(pollTimer.current), []);
+
+  function toggleLender(l) {
+    setSelectedLenders(curr => curr.includes(l) ? curr.filter(x => x !== l) : [...curr, l]);
   }
-  function selectAllLetters() { setPrefixes([...ALPHABET]); }
-  function clearPrefixes() { setPrefixes([]); }
 
-  async function runBatch(e) {
-    e.preventDefault();
-    const queryList = [...prefixes];
-    if (customPrefix.trim()) queryList.push(...customPrefix.split(',').map(s => s.trim()).filter(Boolean));
-    if (!queryList.length) return;
-
+  async function runSweep() {
+    setError(null);
+    setStatus(null);
+    setJob(null);
     setRunning(true);
-    setErrors([]);
-    setLeads([]);
-    setFilingsThrough(null);
+    clearTimeout(pollTimer.current);
 
-    const seen = new Set();
-    const collected = [];
-    const errs = [];
+    const customs = customNames.split(',').map(s => s.trim()).filter(Boolean);
+    const submitBody = {
+      searchType: mode,
+      matchMode: 'BeginsWith',
+      maxQueries: parseInt(maxQueries, 10) || 36,
+      customNames: customs,
+    };
+    if (mode === 'debtor') submitBody.sweep = true;
+    else submitBody.prefixes = selectedLenders;
 
-    for (let i = 0; i < queryList.length; i++) {
-      const q = queryList[i];
-      setProgress({ current: i + 1, total: queryList.length, query: q });
-      try {
-        const res = await fetch('/api/search-ucc', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prefix: q,
-            searchType: mode,
-            matchMode: 'BeginsWith',
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          const detail = data.firecrawl_details
-            ? JSON.stringify(data.firecrawl_details).slice(0, 300)
-            : '';
-          errs.push({
-            query: q,
-            error: `${data.error || `HTTP ${res.status}`}${detail ? ` — ${detail}` : ''}`,
-          });
-          continue;
-        }
-        if (data.filingsCompletedThrough && !filingsThrough) {
-          setFilingsThrough(data.filingsCompletedThrough);
-        }
-        for (const lead of data.leads || []) {
-          const key = `${lead.file_number || ''}|${lead.debtor_name || ''}`;
-          if (key !== '|' && !seen.has(key)) {
-            seen.add(key);
-            collected.push({ ...lead, source_query: q });
-            setLeads([...collected]);
-          }
-        }
-      } catch (err) {
-        errs.push({ query: q, error: err.message });
-      }
+    try {
+      const res = await fetch('/api/scrape-submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(submitBody),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Submit failed (${res.status})`);
+      setJob({ jobId: data.jobId, totalQueries: data.totalQueries });
+      pollStatus(data.jobId);
+    } catch (err) {
+      setError(err.message);
+      setRunning(false);
     }
+  }
 
-    setErrors(errs);
-    setProgress(null);
+  async function pollStatus(jobId) {
+    try {
+      const res = await fetch(`/api/scrape-status?id=${encodeURIComponent(jobId)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || `Status failed (${res.status})`);
+      setStatus(data);
+
+      const filteredCount = applyFilters(data.leads).length;
+      const done = data.status === 'completed' || data.status === 'failed';
+      const capHit = filteredCount >= (parseInt(leadCap, 10) || Infinity);
+
+      if (done || capHit) {
+        setRunning(false);
+      } else {
+        pollTimer.current = setTimeout(() => pollStatus(jobId), 4000);
+      }
+    } catch (err) {
+      setError(err.message);
+      setRunning(false);
+    }
+  }
+
+  function cancelPolling() {
+    clearTimeout(pollTimer.current);
     setRunning(false);
   }
 
+  function applyFilters(leads) {
+    if (!leads) return [];
+    const days = TIME_WINDOWS.find(t => t.id === timeWindow)?.days;
+    if (!days) return leads;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    return leads.filter(l => {
+      const d = parseDate(l.filing_date);
+      return d && d >= cutoff;
+    });
+  }
+
+  function parseDate(s) {
+    if (!s) return null;
+    const m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (!m) return null;
+    return new Date(+m[3], +m[1] - 1, +m[2]);
+  }
+
   function downloadCsv() {
-    if (!leads.length) return;
+    const rows = applyFilters(status?.leads || []).slice(0, parseInt(leadCap, 10) || Infinity);
+    if (!rows.length) return;
     const headers = ['debtor_name', 'file_number', 'filing_date', 'filing_type', 'secured_party', 'address', 'source_query'];
-    const rows = leads.map(l =>
-      headers.map(h => `"${(l[h] ?? '').toString().replace(/"/g, '""')}"`).join(',')
-    );
-    const csv = [headers.join(','), ...rows].join('\n');
+    const body = rows.map(l => headers.map(h => `"${(l[h] ?? '').toString().replace(/"/g, '""')}"`).join(','));
+    const csv = [headers.join(','), ...body].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `fl-ucc-leads-${mode}-${Date.now()}.csv`;
+    a.download = `fl-ucc-${mode}-${timeWindow}-${Date.now()}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
+
+  const filteredLeads = applyFilters(status?.leads || []).slice(0, parseInt(leadCap, 10) || Infinity);
+  const completion = status ? `${status.completed || 0} / ${status.total || job?.totalQueries || 0}` : '';
 
   return (
     <div className="container">
       <header>
         <h1>Florida UCC Lead Pull</h1>
         <p className="sub">
-          Bulk-extract UCC filings from the Florida Secured Transaction Registry.
-          Pick a mode, choose prefixes, and the app will enumerate the registry and dedupe results into a CSV-ready lead list.
+          Async batch-scrape the Florida Secured Transaction Registry.
+          Pick a mode, set a time window, cap the spend, and pull a CSV-ready lead list.
         </p>
       </header>
 
-      <form onSubmit={runBatch} className="panel">
+      <form className="panel" onSubmit={e => { e.preventDefault(); runSweep(); }}>
         <fieldset>
           <legend>Mode</legend>
           <label className="radio">
             <input type="radio" name="mode" checked={mode === 'debtor'} onChange={() => setMode('debtor')} />
-            <span><strong>Debtor name</strong> — pull all businesses with a UCC filed against them (every business that took financing).</span>
+            <span><strong>Debtor sweep</strong> — auto-walk A–Z + 0–9 to pull every business with a recent UCC filing.</span>
           </label>
           <label className="radio">
             <input type="radio" name="mode" checked={mode === 'lender'} onChange={() => setMode('lender')} />
-            <span><strong>Secured Party (lender)</strong> — pull every merchant funded by a specific lender. Great for stealing MCA funder lead lists.</span>
+            <span><strong>Lender (Secured Party)</strong> — pull every merchant funded by selected MCA funders.</span>
           </label>
         </fieldset>
 
-        {mode === 'lender' ? (
+        <fieldset>
+          <legend>Time window (filter)</legend>
+          <div className="chips">
+            {TIME_WINDOWS.map(t => (
+              <button
+                key={t.id}
+                type="button"
+                className={`chip ${timeWindow === t.id ? 'on' : ''}`}
+                onClick={() => setTimeWindow(t.id)}
+              >{t.label}</button>
+            ))}
+          </div>
+        </fieldset>
+
+        <div className="grid">
+          <fieldset>
+            <legend>Max queries (cost cap)</legend>
+            <input type="number" min="1" max="50" value={maxQueries}
+              onChange={e => setMaxQueries(e.target.value)} />
+            <p className="hint">~5 Firecrawl credits per query. 36 = full A–Z sweep.</p>
+          </fieldset>
+          <fieldset>
+            <legend>Max leads (stop polling at)</legend>
+            <input type="number" min="1" value={leadCap}
+              onChange={e => setLeadCap(e.target.value)} />
+            <p className="hint">After this many filtered leads, polling stops.</p>
+          </fieldset>
+        </div>
+
+        {mode === 'lender' && (
           <fieldset>
             <legend>MCA lenders (click to toggle)</legend>
             <div className="chips">
               {MCA_LENDERS.map(l => (
-                <button
-                  key={l}
-                  type="button"
-                  className={`chip ${prefixes.includes(l) ? 'on' : ''}`}
-                  onClick={() => togglePrefix(l)}
-                >
-                  {l}
-                </button>
+                <button key={l} type="button"
+                  className={`chip ${selectedLenders.includes(l) ? 'on' : ''}`}
+                  onClick={() => toggleLender(l)}>{l}</button>
               ))}
             </div>
             <div className="actions">
-              <button type="button" className="link" onClick={clearPrefixes}>Clear</button>
-            </div>
-          </fieldset>
-        ) : (
-          <fieldset>
-            <legend>Debtor name prefixes (A–Z, 0–9)</legend>
-            <div className="chips">
-              {ALPHABET.map(c => (
-                <button
-                  key={c}
-                  type="button"
-                  className={`chip ${prefixes.includes(c) ? 'on' : ''}`}
-                  onClick={() => togglePrefix(c)}
-                >
-                  {c}
-                </button>
-              ))}
-            </div>
-            <div className="actions">
-              <button type="button" className="link" onClick={selectAllLetters}>Select A–Z + 0–9</button>
-              <button type="button" className="link" onClick={clearPrefixes}>Clear</button>
+              <button type="button" className="link" onClick={() => setSelectedLenders([...MCA_LENDERS])}>Select all</button>
+              <button type="button" className="link" onClick={() => setSelectedLenders([])}>Clear</button>
             </div>
           </fieldset>
         )}
 
         <fieldset>
-          <legend>Custom names (comma-separated, optional)</legend>
-          <input
-            type="text"
-            value={customPrefix}
-            onChange={e => setCustomPrefix(e.target.value)}
-            placeholder={mode === 'lender' ? 'e.g. SQUARE CAPITAL, STRIPE CAPITAL' : 'e.g. AB, ACE, AMER'}
-          />
+          <legend>Custom names (optional, comma-separated)</legend>
+          <input type="text" value={customNames}
+            onChange={e => setCustomNames(e.target.value)}
+            placeholder={mode === 'lender' ? 'e.g. STRIPE CAPITAL, BREX' : 'e.g. AB, ACE'} />
         </fieldset>
 
         <div className="submit-row">
-          <button type="submit" disabled={running || (!prefixes.length && !customPrefix.trim())}>
-            {running ? 'Pulling…' : `Run batch (${prefixes.length + (customPrefix.trim() ? customPrefix.split(',').filter(s => s.trim()).length : 0)} queries)`}
-          </button>
-          {leads.length > 0 && (
+          {!running ? (
+            <button type="submit">Run sweep</button>
+          ) : (
+            <button type="button" onClick={cancelPolling}>Stop polling</button>
+          )}
+          {filteredLeads.length > 0 && (
             <button type="button" className="primary" onClick={downloadCsv}>
-              Export {leads.length} leads to CSV
+              Export {filteredLeads.length} leads to CSV
             </button>
           )}
         </div>
       </form>
 
-      {progress && (
+      {error && <div className="errors"><strong>Error:</strong> {error}</div>}
+
+      {job && (
         <div className="progress">
-          Querying <strong>{progress.query}</strong> ({progress.current} / {progress.total})…
-          <div className="progress-bar"><div style={{ width: `${(progress.current / progress.total) * 100}%` }} /></div>
-        </div>
-      )}
-
-      {filingsThrough && (
-        <div className="meta">Registry current through: <strong>{filingsThrough}</strong></div>
-      )}
-
-      {leads.length > 0 && (
-        <>
-          <div className="meta">
-            Collected <strong>{leads.length}</strong> unique leads across <strong>{prefixes.length + (customPrefix.trim() ? customPrefix.split(',').filter(s => s.trim()).length : 0)}</strong> queries.
+          <div>
+            <strong>Job {job.jobId.slice(0, 8)}…</strong> · Status: <code>{status?.status || 'submitting'}</code>
+            · Queries: <strong>{completion}</strong>
+            · Filtered leads: <strong>{filteredLeads.length}</strong>
+            {status?.creditsUsed != null && <> · Credits: <strong>{status.creditsUsed}</strong></>}
           </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Debtor</th>
-                <th>File #</th>
-                <th>Filed</th>
-                <th>Type</th>
-                <th>Secured Party</th>
-                <th>Address</th>
-                <th>Source query</th>
-              </tr>
-            </thead>
-            <tbody>
-              {leads.slice(0, 500).map((l, i) => (
-                <tr key={i}>
-                  <td>{l.debtor_name}</td>
-                  <td>{l.file_number}</td>
-                  <td>{l.filing_date}</td>
-                  <td>{l.filing_type}</td>
-                  <td>{l.secured_party}</td>
-                  <td>{l.address}</td>
-                  <td className="muted">{l.source_query}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {leads.length > 500 && (
-            <div className="meta muted">Showing first 500 of {leads.length}. Export to CSV for the full list.</div>
+          {status?.total > 0 && (
+            <div className="progress-bar">
+              <div style={{ width: `${(status.completed / status.total) * 100}%` }} />
+            </div>
           )}
-        </>
+        </div>
       )}
 
-      {errors.length > 0 && (
-        <div className="errors">
-          <h3>Errors ({errors.length})</h3>
-          <ul>
-            {errors.map((e, i) => <li key={i}><code>{e.query}</code>: {e.error}</li>)}
-          </ul>
-        </div>
+      {status?.filingsCompletedThrough && (
+        <div className="meta">Registry current through: <strong>{status.filingsCompletedThrough}</strong></div>
+      )}
+
+      {filteredLeads.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>Debtor</th>
+              <th>File #</th>
+              <th>Filed</th>
+              <th>Type</th>
+              <th>Secured Party</th>
+              <th>Address</th>
+              <th>Query</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredLeads.slice(0, 500).map((l, i) => (
+              <tr key={i}>
+                <td>{l.debtor_name}</td>
+                <td>{l.file_number}</td>
+                <td>{l.filing_date}</td>
+                <td>{l.filing_type}</td>
+                <td>{l.secured_party}</td>
+                <td>{l.address}</td>
+                <td className="muted">{l.source_query}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {filteredLeads.length > 500 && (
+        <div className="meta muted">Showing first 500 of {filteredLeads.length}. Export CSV for the full list.</div>
       )}
 
       <footer>
         <p>
-          Data: floridaucc.com · Scraping is rate-limited and best for moderate volume.
-          For daily production volume, see Florida's <a href="https://floridaucc.com/" target="_blank" rel="noreferrer">UCC Secured Transactions Download</a> bulk feed.
+          Data: floridaucc.com · For production-volume MCA lead lists, use Florida's
+          {' '}<a href="https://floridaucc.com/" target="_blank" rel="noreferrer">UCC Secured Transactions Download</a> bulk feed.
         </p>
       </footer>
     </div>

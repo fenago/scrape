@@ -81,7 +81,21 @@ legend {
 
 .actions { margin-top: 0.75rem; display: flex; gap: 1rem; }
 
-input[type="text"] {
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+@media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+
+.hint {
+  margin: 0.4rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+input[type="text"], input[type="number"] {
   width: 100%;
   background: var(--bg);
   color: var(--text);
@@ -90,7 +104,14 @@ input[type="text"] {
   padding: 0.6rem 0.75rem;
   font-size: 0.92rem;
 }
-input[type="text"]:focus { outline: none; border-color: var(--accent); }
+input[type="text"]:focus, input[type="number"]:focus { outline: none; border-color: var(--accent); }
+input[type="number"] { max-width: 160px; }
+code {
+  background: rgba(0,0,0,0.3);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.82em;
+}
 
 .submit-row {
   display: flex;

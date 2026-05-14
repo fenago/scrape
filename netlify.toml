@@ -9,8 +9,13 @@
   targetPort = 5173
 
 [[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/:splat"
+  from = "/api/scrape-submit"
+  to = "/.netlify/functions/scrape-submit"
+  status = 200
+
+[[redirects]]
+  from = "/api/scrape-status"
+  to = "/.netlify/functions/scrape-status"
   status = 200
 
 [[redirects]]
