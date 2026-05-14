@@ -60,7 +60,11 @@ export async function handler(event) {
   try { body = JSON.parse(event.body || '{}'); } catch { return json(400, { error: 'Invalid JSON body' }); }
 
   const searchType = SEARCH_TYPE_MAP[body.searchType] ? body.searchType : 'debtor';
-  const matchMode = body.matchMode === 'Exact' ? 'Exact' : 'BeginsWith';
+  // searchCategory in the URL controls the INITIAL Result Set value. The valid
+  // value observed in production is "Standard" (gives Standard search logic by
+  // default; we then click Proximity via JS if asked). "BeginsWith" leaves the
+  // Result Set field unset, which silently breaks the search.
+  const searchCategory = 'Standard';
   const searchLogic = body.searchLogic === 'standard' ? 'standard' : 'proximity';
   const logicNeedle = searchLogic === 'standard' ? 'standard' : 'proximity';
 
@@ -79,7 +83,7 @@ export async function handler(event) {
     `?text=${encodeURIComponent(p)}` +
     `&searchOptionType=${cfg.searchOptionType}` +
     `&searchOptionSubOption=${cfg.searchOptionSubOption}` +
-    `&searchCategory=${matchMode}`
+    `&searchCategory=${searchCategory}`
   );
 
   const payload = {
