@@ -1,28 +1,78 @@
-// Scrape GA Secured Party UCC search (search.gsccca.org).
+// Scrape GA Secured Party UCC search via Firecrawl's actions API.
 //
-// GA's site is plain ASP — no SPA, no JS rendering, no Firecrawl needed. Just
-// classic form posts with session cookies. Per-query cost is effectively zero.
+// The direct-POST approach failed silently — GSCCCA's ASP backend returns
+// "no items matching" for our function's POST but returns full results for a
+// real browser session with the same form values. We don't know which session
+// var / hidden state we're missing, and chasing it has already burned hours.
 //
-// Flow:
-//   1. POST login.asp with GSCCCA creds → capture ASPSESSIONID cookie.
-//   2. For each lender (in parallel): POST securedresults.asp with the
-//      cookie + search params → get full HTML results page.
-//   3. Parse the results table with cheerio.
-//   4. Aggregate + dedupe, return JSON to the UI.
+// Switching to Firecrawl REST: each search runs in a real browser, so we get
+// exactly what a logged-in user would see. Costs ~10-15 Firecrawl credits per
+// lender, but reliable.
 //
-// Required Netlify env vars: GSCCCA_USER, GSCCCA_PASS
+// Required Netlify env vars: GSCCCA_USER, GSCCCA_PASS, FIRECRAWL_API_KEY
 
-import * as cheerio from 'cheerio';
+const FIRECRAWL_SCRAPE = 'https://api.firecrawl.dev/v1/scrape';
+const PER_QUERY_TIMEOUT_MS = 90000;
 
-const LOGIN_URL = 'https://apps.gsccca.org/login.asp?sFormAction=';
-const SEARCH_URL = 'https://search.gsccca.org/UCC_Search/securedresults.asp';
-const PER_QUERY_TIMEOUT_MS = 8000;
+// Date range limit: GSCCCA free "limited use" accounts silently clamp FromDate
+// to 1 year ago. Surfacing it here so the UI can warn users + we don't bother
+// sending older dates that will just get clamped.
+export const MAX_LOOKBACK_DAYS = 365;
+
+const LEAD_SCHEMA = {
+  type: 'object',
+  properties: {
+    page_kind: {
+      type: 'string',
+      description:
+        'Which type of GSCCCA results page is rendered: ' +
+        '"variants" if the page lists secured-party NAME variants with instrument counts (columns include SELECT/INSTRUMENTS/SECURED PARTY NAME); ' +
+        '"filings" if the page lists individual UCC filings (columns include FILE NUMBER/DATE/DEBTOR/SECURED PARTY); ' +
+        '"none" if the page says no items matching the search; ' +
+        '"login" if the page is the login form (session expired); ' +
+        '"other" otherwise.',
+    },
+    total_matched: {
+      type: 'string',
+      description: 'The "N records matched" or "N variations of the name found" text near the top of results.',
+    },
+    variants: {
+      type: 'array',
+      description: 'When page_kind = "variants": each row showing a secured-party name and its instrument count.',
+      items: {
+        type: 'object',
+        properties: {
+          secured_party_name: { type: 'string' },
+          instrument_count: { type: 'number' },
+        },
+      },
+    },
+    filings: {
+      type: 'array',
+      description: 'When page_kind = "filings": each UCC filing row with debtor + filing info.',
+      items: {
+        type: 'object',
+        properties: {
+          debtor_name: { type: 'string' },
+          file_number: { type: 'string' },
+          filing_date: { type: 'string' },
+          filing_type: { type: 'string' },
+          secured_party: { type: 'string' },
+          county: { type: 'string' },
+          status: { type: 'string' },
+        },
+      },
+    },
+  },
+  required: ['page_kind'],
+};
 
 export async function handler(event) {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
-
+  const fcKey = process.env.FIRECRAWL_API_KEY;
   const user = process.env.GSCCCA_USER;
   const pass = process.env.GSCCCA_PASS;
+  if (!fcKey) return json(500, { error: 'FIRECRAWL_API_KEY env var not set' });
   if (!user || !pass) return json(500, { error: 'GSCCCA_USER / GSCCCA_PASS env vars not set' });
 
   let body;
@@ -32,216 +82,144 @@ export async function handler(event) {
     .map(s => (s || '').trim())
     .filter(Boolean);
   if (!lenders.length) return json(400, { error: 'At least one lender name is required' });
-  if (lenders.length > 25) return json(400, { error: 'Max 25 lenders per batch (Netlify 10s timeout)' });
+  if (lenders.length > 10) return json(400, { error: 'Max 10 lenders per batch (Firecrawl cost cap, ~10 credits each)' });
 
-  const fromDate = body.fromDate || '01/01/2024';
-  const toDate = body.toDate || todayMMDDYYYY();
+  // Clamp FromDate to MAX_LOOKBACK_DAYS — GSCCCA limited-use accounts cap it
+  // server-side anyway, surfacing it here so the user sees what's actually used.
+  const today = new Date();
+  const earliestAllowed = new Date(today.getTime() - MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  const requestedFromDate = body.fromDate || mmddyyyy(earliestAllowed);
+  const requestedToDate = body.toDate || mmddyyyy(today);
+  const fromDate = clampDateAtLeast(requestedFromDate, earliestAllowed);
+  const toDate = requestedToDate;
+  const dateClamped = fromDate !== requestedFromDate;
+
   const maxrows = clamp(parseInt(body.maxrows, 10) || 100, 10, 100);
-  const stemSearch = body.stemSearch !== false; // default true (fuzzy)
-  const debug = body.debug === true;
+  const stemSearch = body.stemSearch !== false;
 
-  // Step 1: log in once.
-  let cookie;
-  try {
-    cookie = await login(user, pass);
-  } catch (err) {
-    return json(502, { error: `Login failed: ${err.message}` });
-  }
-  if (!cookie) return json(502, { error: 'Login produced no session cookie (bad creds?)' });
-
-  // Step 1.5: visit the Secured Party Search form page to establish session
-  // state (the ASP backend may rely on Session() vars set by the page-load
-  // sequence — TurnSPIndOff etc — so a cold POST may be rejected).
-  try {
-    await fetchWithTimeout(
-      'https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty',
-      { method: 'GET', headers: { Cookie: cookie, 'User-Agent': 'Mozilla/5.0' } },
-      PER_QUERY_TIMEOUT_MS
-    );
-  } catch { /* non-fatal */ }
-
-  // Step 2: search all lenders in parallel.
+  // For each lender, kick off Firecrawl in parallel.
   const perQuery = await Promise.all(lenders.map(async (lender) => {
     const t0 = Date.now();
     try {
-      const { html, status, finalUrl } = await searchLender(cookie, lender, fromDate, toDate, maxrows, stemSearch);
-      const parsed = parseResults(html);
+      const result = await runFirecrawlSearch({
+        fcKey, user, pass, lender, fromDate, toDate, maxrows, stemSearch,
+      });
       return {
         lender,
-        httpStatus: status,
-        leadCount: parsed.leads.length,
-        totalMatched: parsed.totalMatched,
-        finalUrl,
-        leads: parsed.leads.map(l => ({ ...l, source_lender: lender })),
+        status: 'ok',
+        page_kind: result.page_kind,
+        total_matched: result.total_matched,
+        variants: result.variants || [],
+        filings: result.filings || [],
         elapsedMs: Date.now() - t0,
-        // When debug=true, ship up to 60 KB of raw HTML — enough to capture
-        // the results table or "no items matching" content below the header.
-        debugHtml: debug ? html.slice(0, 60000) : undefined,
-        debugHtmlLength: debug ? html.length : undefined,
       };
     } catch (err) {
       return {
         lender,
-        httpStatus: 0,
-        leadCount: 0,
-        totalMatched: '',
-        leads: [],
+        status: 'error',
         error: err.message,
+        variants: [],
+        filings: [],
         elapsedMs: Date.now() - t0,
       };
     }
   }));
 
-  // Step 3: aggregate + dedupe across queries.
+  // Aggregate leads (filings) across all lenders + dedupe.
   const seen = new Set();
-  const allLeads = [];
+  const leads = [];
   for (const q of perQuery) {
-    for (const l of q.leads) {
-      const key = `${l.file_number || ''}|${l.debtor_name || ''}|${l.county || ''}`;
+    for (const f of q.filings) {
+      const key = `${f.file_number || ''}|${f.debtor_name || ''}|${f.county || ''}`;
       if (key === '||' || seen.has(key)) continue;
       seen.add(key);
-      allLeads.push(l);
+      leads.push({ ...f, source_lender: q.lender });
     }
   }
 
   return json(200, {
-    leads: allLeads,
-    perQuery: perQuery.map(({ leads, ...rest }) => rest), // drop nested leads from per-query summary
-    params: { fromDate, toDate, maxrows, stemSearch },
+    leads,
+    perQuery,
+    params: { fromDate, toDate, requestedFromDate, dateClamped, maxrows, stemSearch },
     completedAt: new Date().toISOString(),
   });
 }
 
-async function login(user, pass) {
-  const body = new URLSearchParams({ txtUserID: user, txtPassword: pass });
-  const res = await fetchWithTimeout(LOGIN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0 (compatible; UCC-Lead-App/0.2)',
+async function runFirecrawlSearch({ fcKey, user, pass, lender, fromDate, toDate, maxrows, stemSearch }) {
+  // JS payload that runs inside the page after login.
+  // Has to be a single-line-friendly string (escape carefully).
+  const fillFormJs = (
+    "const f=document.frmSearch;" +
+    "if(typeof TurnSPIndOff==='function')TurnSPIndOff();" +
+    "f.SecuredPartyOrganizationName.disabled=false;" +
+    `f.SecuredPartyOrganizationName.value=${JSON.stringify(lender)};` +
+    "Array.from(f.securedsearch).forEach(r=>r.checked=(r.value==='0'));" +
+    `Array.from(f.SecuredPartyExact).forEach(r=>r.checked=(r.value===${stemSearch ? "'0'" : "'1'"}));` +
+    `f.FromDate.value=${JSON.stringify(fromDate)};` +
+    `f.ToDate.value=${JSON.stringify(toDate)};` +
+    `f.maxrows.value=${JSON.stringify(String(maxrows))};` +
+    "f.submit();"
+  );
+
+  const payload = {
+    url: 'https://apps.gsccca.org/login.asp',
+    formats: ['json', 'markdown'],
+    jsonOptions: {
+      schema: LEAD_SCHEMA,
+      prompt:
+        'You are looking at a Georgia GSCCCA UCC search results page. Determine page_kind: ' +
+        '"variants" if the page lists matching secured-party NAME variants (each row has an instrument count and a name); ' +
+        '"filings" if the page lists individual UCC filings with debtor and file number columns; ' +
+        '"none" if the body contains text like "no items matching your search"; ' +
+        '"login" if the page shows a login form (session expired); ' +
+        'else "other". Extract every row of variants or filings. Also extract any "N records matched" / "N variations of the name found" text.',
     },
-    body: body.toString(),
-    redirect: 'manual',
+    onlyMainContent: false,
+    waitFor: 1000,
+    timeout: 75000,
+    actions: [
+      // 1. Log in.
+      { type: 'wait', milliseconds: 1500 },
+      { type: 'executeJavascript', script:
+        `document.frmLogin.txtUserID.value=${JSON.stringify(user)};` +
+        `document.frmLogin.txtPassword.value=${JSON.stringify(pass)};` +
+        "document.frmLogin.submit();"
+      },
+      { type: 'wait', milliseconds: 4000 },
+      // 2. Navigate to Secured Party Search form.
+      { type: 'executeJavascript', script:
+        "window.location.href='https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty';"
+      },
+      { type: 'wait', milliseconds: 4500 },
+      // 3. Fill + submit search form.
+      { type: 'executeJavascript', script: fillFormJs },
+      // 4. Wait for results page to render.
+      { type: 'wait', milliseconds: 7500 },
+    ],
+  };
+
+  const res = await fetchWithTimeout(FIRECRAWL_SCRAPE, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${fcKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   }, PER_QUERY_TIMEOUT_MS);
 
-  // GSCCCA sets ASPSESSIONID + login cookies on a 302 redirect after successful login.
-  const setCookieRaw = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
-  if (!setCookieRaw.length) {
-    const single = res.headers.get('set-cookie');
-    if (single) setCookieRaw.push(single);
+  const raw = await res.text();
+  let data;
+  try { data = JSON.parse(raw); } catch {
+    throw new Error(`Firecrawl returned non-JSON: ${raw.slice(0, 200)}`);
   }
-  if (!setCookieRaw.length) {
-    throw new Error(`No Set-Cookie returned (HTTP ${res.status}). Login likely failed.`);
-  }
-  return setCookieRaw.map(c => c.split(';')[0]).join('; ');
-}
-
-async function searchLender(cookie, lender, fromDate, toDate, maxrows, stemSearch) {
-  const body = new URLSearchParams({
-    securedsearch: '0',                       // 0 = Organization, 1 = Individual
-    SecuredPartyOrganizationName: lender,
-    SecuredPartyLastName: '',
-    SecuredPartyFirstName: '',
-    SecuredPartyMiddleName: '',
-    SecuredPartyExact: stemSearch ? '0' : '1', // 0 = Stem (fuzzy), 1 = Exact
-    FromDate: fromDate,
-    ToDate: toDate,
-    maxrows: String(maxrows),
-  });
-  const res = await fetchWithTimeout(SEARCH_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      Cookie: cookie,
-      'User-Agent': 'Mozilla/5.0 (compatible; UCC-Lead-App/0.2)',
-      Referer: 'https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty',
-    },
-    body: body.toString(),
-  }, PER_QUERY_TIMEOUT_MS);
-
-  const html = await res.text();
-  return { html, status: res.status, finalUrl: res.url };
-}
-
-// Parse the GA results page. Handles three cases:
-//   1. "No items matching your search" → empty leads, totalMatched: "0"
-//   2. A real results table with rows → parsed leads
-//   3. Login expired / error page → throws so the caller surfaces it
-function parseResults(html) {
-  const $ = cheerio.load(html);
-  const bodyText = $.root().text().replace(/\s+/g, ' ').trim();
-
-  // Case 1: explicit no-results message.
-  if (/no\s+items?\s+matching\s+your\s+search/i.test(bodyText) ||
-      /no\s+(?:records?|results?)\s+(?:were\s+)?found/i.test(bodyText)) {
-    return { leads: [], totalMatched: '0' };
+  if (!res.ok || data.success === false) {
+    throw new Error(data.error || data.message || `Firecrawl HTTP ${res.status}`);
   }
 
-  // Case 3: redirected back to login page = session died.
-  if (/please\s+enter.*login\s+name\s+and\s+password/i.test(bodyText) ||
-      $('input[name="txtUserID"]').length > 0) {
-    throw new Error('GSCCCA session expired or login bounced (page returned login form)');
-  }
-
-  // Case 2: find a real results table. Required signal: a header row that
-  // mentions "debtor" AND ("file" OR "instrument" OR "date").
-  let resultsTable = null;
-  $('table').each((i, t) => {
-    const headers = $(t).find('tr').first().find('th, td').map((j, c) => $(c).text().trim().toLowerCase()).get();
-    const joined = headers.join(' ');
-    if (joined.includes('debtor') && /\b(file|instrument|date|document)\b/.test(joined)) {
-      resultsTable = $(t);
-      return false;
-    }
-  });
-
-  const leads = [];
-  if (resultsTable) {
-    const headerCells = resultsTable.find('tr').first().find('th, td').map((i, c) => $(c).text().trim().toLowerCase()).get();
-    const colIdx = (...candidates) => {
-      for (const cand of candidates) {
-        const i = headerCells.findIndex(h => h.includes(cand));
-        if (i >= 0) return i;
-      }
-      return -1;
-    };
-    const idx = {
-      debtor:      colIdx('debtor', 'name'),
-      file_number: colIdx('file', 'document', 'instrument'),
-      filing_date: colIdx('date'),
-      filing_type: colIdx('type'),
-      secured:     colIdx('secured', 'party'),
-      county:      colIdx('county'),
-      status:      colIdx('status'),
-    };
-
-    resultsTable.find('tr').slice(1).each((i, row) => {
-      const cells = $(row).find('td').map((j, c) => $(c).text().trim().replace(/\s+/g, ' ')).get();
-      if (cells.length < 2) return;
-      const pick = i => (i >= 0 && i < cells.length ? cells[i] : '');
-      const lead = {
-        debtor_name: pick(idx.debtor),
-        file_number: pick(idx.file_number),
-        filing_date: pick(idx.filing_date),
-        filing_type: pick(idx.filing_type),
-        secured_party: pick(idx.secured),
-        county: pick(idx.county),
-        status: pick(idx.status),
-        address: '', city: '', state: '', zip: '',
-        raw_cells: cells,
-      };
-      // Skip junk rows (header re-shows, pagination, etc).
-      if (!lead.debtor_name || lead.debtor_name.length < 2) return;
-      if (/^\s*query\s+made/i.test(lead.debtor_name)) return;
-      if (/^\s*display\s+results/i.test(lead.debtor_name)) return;
-      leads.push(lead);
-    });
-  }
-
-  const totalMatch = bodyText.match(/(\d+(?:,\d{3})*)\s+(?:records?|results?|items?)\s+(?:matched|found)/i);
-  const totalMatched = totalMatch ? totalMatch[1] : (leads.length ? String(leads.length) : '');
-
-  return { leads, totalMatched };
+  const json = data?.data?.json || data?.data?.extract || {};
+  return {
+    page_kind: json.page_kind || 'unknown',
+    total_matched: json.total_matched || '',
+    variants: Array.isArray(json.variants) ? json.variants : [],
+    filings: Array.isArray(json.filings) ? json.filings : [],
+  };
 }
 
 async function fetchWithTimeout(url, opts, timeoutMs) {
@@ -254,9 +232,14 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   }
 }
 
-function todayMMDDYYYY() {
-  const d = new Date();
-  return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+function mmddyyyy(date) {
+  return `${date.getMonth() + 1}/${date.getDate()}/${date.getFullYear()}`;
+}
+function clampDateAtLeast(s, minDate) {
+  const m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (!m) return mmddyyyy(minDate);
+  const d = new Date(+m[3], +m[1] - 1, +m[2]);
+  return d < minDate ? mmddyyyy(minDate) : s;
 }
 function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
 function json(statusCode, body) {

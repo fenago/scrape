@@ -1,15 +1,13 @@
 import { useState } from 'react';
 
-// MCA filing entities most commonly seen on UCC-1s. GA's search supports
-// "Stem Search" (fuzzy), so we use bare brand/legal names and let the search
-// catch variants (KABBAGE INC, KABBAGE FUNDING LLC, etc.).
+// Real MCA UCC filing entities. GA's Stem Search catches variants automatically.
 const MCA_LENDERS = [
-  // Banks that originate loans for many fintech MCAs (highest hit rate):
+  // High-volume bank originators for fintech MCAs:
   'CELTIC BANK',
   'WEBBANK',
   'CROSS RIVER BANK',
   'AMERICAN EXPRESS NATIONAL BANK',
-  // Direct MCA / fintech lenders:
+  // Direct MCA lenders:
   'KABBAGE',
   'ON DECK CAPITAL',
   'BLUEVINE',
@@ -33,23 +31,19 @@ const MCA_LENDERS = [
   'FOX CAPITAL',
   'LENDISTRY',
   'LENDR',
-  'CLOUDFUND',
   'KAPITUS',
-  'EXPANSION CAPITAL',
 ];
 
-// Highest-volume GA UCC filers in the MCA space (verified high hit-rate).
-// Celtic Bank + WebBank originate loans for dozens of fintech MCAs each.
-// Amex National Bank is post-acquisition Kabbage and most current Amex Business
-// Blueprint loans.
-const DEFAULT_LENDERS = ['CELTIC BANK', 'WEBBANK', 'AMERICAN EXPRESS NATIONAL BANK', 'ON DECK CAPITAL', 'KAPITUS'];
+const DEFAULT_LENDERS = ['CELTIC BANK', 'WEBBANK', 'KABBAGE'];
 
+// GSCCCA free accounts silently clamp FromDate to 1 year ago, so the UI
+// limits to options inside that window.
 const TIME_WINDOWS = [
   { id: '7d',  label: 'Last 7 days',  days: 7 },
   { id: '30d', label: 'Last 30 days', days: 30 },
   { id: '90d', label: 'Last 90 days', days: 90 },
-  { id: '1y',  label: 'Last year',    days: 365 },
-  { id: 'all', label: 'All time (since 1995)', days: null },
+  { id: '180d', label: 'Last 180 days', days: 180 },
+  { id: '365d', label: 'Last 12 months (max for free account)', days: 365 },
 ];
 
 function mmddyyyy(date) {
@@ -57,10 +51,9 @@ function mmddyyyy(date) {
 }
 
 export default function App() {
-  const [timeWindow, setTimeWindow] = useState('1y');
+  const [timeWindow, setTimeWindow] = useState('365d');
   const [stemSearch, setStemSearch] = useState(true);
   const [maxrows, setMaxrows] = useState(100);
-  const [debug, setDebug] = useState(false);
   const [selectedLenders, setSelectedLenders] = useState([...DEFAULT_LENDERS]);
   const [customNames, setCustomNames] = useState('');
   const [csvPreview, setCsvPreview] = useState('raw');
@@ -74,9 +67,8 @@ export default function App() {
   }
 
   function dateRange() {
-    const tw = TIME_WINDOWS.find(t => t.id === timeWindow);
+    const tw = TIME_WINDOWS.find(t => t.id === timeWindow) || TIME_WINDOWS[TIME_WINDOWS.length - 1];
     const today = new Date();
-    if (!tw?.days) return { fromDate: '01/01/1995', toDate: mmddyyyy(today) };
     const from = new Date(today.getTime() - tw.days * 24 * 60 * 60 * 1000);
     return { fromDate: mmddyyyy(from), toDate: mmddyyyy(today) };
   }
@@ -95,7 +87,7 @@ export default function App() {
       const res = await fetch('/api/scrape-ga', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lenders, fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch, debug }),
+        body: JSON.stringify({ lenders, fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -108,7 +100,7 @@ export default function App() {
   }
 
   function rawCsv(rows) {
-    const headers = ['debtor_name', 'file_number', 'filing_date', 'filing_type', 'secured_party', 'county', 'status', 'address', 'city', 'state', 'zip', 'source_lender'];
+    const headers = ['debtor_name', 'file_number', 'filing_date', 'filing_type', 'secured_party', 'county', 'status', 'source_lender'];
     const body = rows.map(l => headers.map(h => csvCell(l[h])).join(','));
     return [headers.join(','), ...body].join('\n');
   }
@@ -117,7 +109,7 @@ export default function App() {
     const body = rows.map(l => {
       const tags = ['ucc-ga-lead', l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`, l.county && `county-${l.county.toLowerCase().replace(/\s+/g, '-')}`].filter(Boolean).join('; ');
       const notes = [`UCC #${l.file_number}`, l.filing_date && `Filed: ${l.filing_date}`, l.filing_type && `Type: ${l.filing_type}`, l.secured_party && `Secured Party: ${l.secured_party}`, l.status && `Status: ${l.status}`].filter(Boolean).join(' | ');
-      return ['', '', '', '', l.debtor_name, l.address, l.city, l.state || 'GA', l.zip, 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
+      return ['', '', '', '', l.debtor_name, '', '', 'GA', '', 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
     });
     return [headers.join(','), ...body].join('\n');
   }
@@ -131,14 +123,15 @@ export default function App() {
 
   const leads = response?.leads || [];
   const previewText = csvPreview === 'raw' ? rawCsv(leads) : ghlCsv(leads);
+  const totalVariants = (response?.perQuery || []).reduce((s, q) => s + (q.variants?.length || 0), 0);
+  const totalFilings = (response?.perQuery || []).reduce((s, q) => s + (q.filings?.length || 0), 0);
 
   return (
     <div className="container">
       <header>
         <h1>Georgia UCC Lead Pull</h1>
         <p className="sub">
-          Pull every merchant funded by selected MCA lenders, straight from the Georgia GSCCCA UCC index.
-          Logs in once, runs all lender queries in parallel, returns deduped leads ready for GHL.
+          Pull MCA leads from the Georgia GSCCCA UCC index. Real browser sessions via Firecrawl, so the site can't reject the requests. ~10 credits per lender.
         </p>
       </header>
 
@@ -152,6 +145,7 @@ export default function App() {
           </div>
           <p className="hint">
             Filings dated <strong>{dateRange().fromDate}</strong> through <strong>{dateRange().toDate}</strong>.
+            GSCCCA free accounts cap the lookback at 12 months — older dates get silently clamped server-side.
           </p>
         </fieldset>
 
@@ -161,29 +155,17 @@ export default function App() {
             <button type="button" className={`chip ${stemSearch ? 'on' : ''}`} onClick={() => setStemSearch(true)}>Stem (fuzzy — recommended)</button>
             <button type="button" className={`chip ${!stemSearch ? 'on' : ''}`} onClick={() => setStemSearch(false)}>Exact</button>
           </div>
-          <p className="hint">Stem catches "KABBAGE", "KABBAGE INC", "KABBAGE FUNDING LLC" with one query.</p>
-        </fieldset>
-
-        <fieldset>
-          <legend>Debug mode</legend>
-          <div className="chips">
-            <button type="button" className={`chip ${debug ? 'on' : ''}`} onClick={() => setDebug(!debug)}>
-              {debug ? 'Debug ON — return raw HTML' : 'Debug OFF'}
-            </button>
-          </div>
-          <p className="hint">Returns the first 4 KB of GSCCCA's raw response for each lender so we can see what the server actually says. Turn on for ONE-lender test runs only.</p>
         </fieldset>
 
         <div className="grid">
           <fieldset>
             <legend>Results per lender (10–100)</legend>
             <input type="number" min="10" max="100" value={maxrows} onChange={e => setMaxrows(e.target.value)} />
-            <p className="hint">100 = max page size. Each lender returns up to this many rows.</p>
           </fieldset>
           <fieldset>
             <legend>Lenders selected</legend>
-            <div className="big-num" style={{ paddingTop: '0.4rem' }}>{selectedLenders.length + customNames.split(',').filter(s => s.trim()).length}<span className="small"> / {MCA_LENDERS.length}+</span></div>
-            <p className="hint">Max 25 per batch (Netlify 10s sync limit).</p>
+            <div className="big-num" style={{ paddingTop: '0.4rem' }}>{selectedLenders.length + customNames.split(',').filter(s => s.trim()).length}<span className="small"> / 10 max</span></div>
+            <p className="hint">~10 Firecrawl credits per lender. 5 lenders ≈ 50 credits per run.</p>
           </fieldset>
         </div>
 
@@ -195,7 +177,6 @@ export default function App() {
             ))}
           </div>
           <div className="actions">
-            <button type="button" className="link" onClick={() => setSelectedLenders([...MCA_LENDERS])}>Select all</button>
             <button type="button" className="link" onClick={() => setSelectedLenders([...DEFAULT_LENDERS])}>Reset to defaults</button>
             <button type="button" className="link" onClick={() => setSelectedLenders([])}>Clear</button>
           </div>
@@ -203,11 +184,11 @@ export default function App() {
 
         <fieldset>
           <legend>Extra lender names (optional, comma-separated)</legend>
-          <input type="text" value={customNames} onChange={e => setCustomNames(e.target.value)} placeholder="e.g. STRIPE CAPITAL, BREX, BRAND NEW LENDER" />
+          <input type="text" value={customNames} onChange={e => setCustomNames(e.target.value)} placeholder="e.g. STRIPE CAPITAL, BREX" />
         </fieldset>
 
         <div className="submit-row">
-          <button type="submit" disabled={running}>{running ? 'Running…' : 'Run sweep'}</button>
+          <button type="submit" disabled={running}>{running ? 'Running (~15s per lender)…' : 'Run sweep'}</button>
           {leads.length > 0 && (
             <>
               <button type="button" className="primary" onClick={() => downloadFile(rawCsv(leads), `ga-ucc-raw-${Date.now()}.csv`)}>
@@ -223,6 +204,12 @@ export default function App() {
 
       {error && <div className="errors"><strong>Error:</strong> {error}</div>}
 
+      {response?.params?.dateClamped && (
+        <div className="errors" style={{ borderColor: '#d29922', background: 'rgba(210,153,34,0.1)', color: '#d29922' }}>
+          <strong>Date clamped:</strong> requested FromDate <code>{response.params.requestedFromDate}</code> was clamped by GSCCCA to <code>{response.params.fromDate}</code> (free account limit).
+        </div>
+      )}
+
       {response && (
         <div className="panel live-status">
           <div className="live-row">
@@ -235,12 +222,12 @@ export default function App() {
               <div className="big-label">Unique leads</div>
             </div>
             <div>
-              <div className="big-num">{response.perQuery?.reduce((s, q) => s + (q.leadCount || 0), 0) || 0}</div>
-              <div className="big-label">Total rows (before dedupe)</div>
+              <div className="big-num">{totalFilings}</div>
+              <div className="big-label">Total filings found</div>
             </div>
             <div>
-              <div className="big-num">{Math.max(...(response.perQuery?.map(q => q.elapsedMs) || [0]))}ms</div>
-              <div className="big-label">Slowest query</div>
+              <div className="big-num">{totalVariants}</div>
+              <div className="big-label">Lender variants seen</div>
             </div>
           </div>
         </div>
@@ -250,32 +237,42 @@ export default function App() {
         <details className="panel" open>
           <summary><strong>Per-lender results ({response.perQuery.length})</strong></summary>
           <table className="compact">
-            <thead><tr><th>#</th><th>Lender</th><th>HTTP</th><th>Rows</th><th>Total matched</th><th>Elapsed</th><th>Error</th></tr></thead>
+            <thead><tr><th>#</th><th>Lender</th><th>Page kind</th><th>Total matched</th><th>Variants</th><th>Filings</th><th>Elapsed</th><th>Error</th></tr></thead>
             <tbody>
               {response.perQuery.map((q, i) => (
                 <tr key={i}>
                   <td>{i + 1}</td>
                   <td><code>{q.lender}</code></td>
-                  <td>{q.httpStatus}</td>
-                  <td>{q.leadCount}</td>
-                  <td className="muted">{q.totalMatched || '–'}</td>
+                  <td><code>{q.page_kind || '–'}</code></td>
+                  <td className="muted">{q.total_matched || '–'}</td>
+                  <td>{q.variants?.length || 0}</td>
+                  <td>{q.filings?.length || 0}</td>
                   <td className="muted">{q.elapsedMs}ms</td>
                   <td className="muted">{q.error || ''}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {response.perQuery.some(q => q.debugHtml) && (
-            <details style={{ marginTop: '1rem' }}>
-              <summary><strong>Raw HTML response (debug)</strong></summary>
-              {response.perQuery.filter(q => q.debugHtml).map((q, i) => (
-                <div key={i} style={{ marginBottom: '1rem' }}>
-                  <div className="muted small-text">{q.lender} · finalUrl: <code>{q.finalUrl}</code></div>
-                  <pre className="csv-preview" style={{ maxHeight: '400px' }}>{q.debugHtml}</pre>
-                </div>
-              ))}
-            </details>
-          )}
+        </details>
+      )}
+
+      {response?.perQuery?.some(q => q.variants?.length > 0) && (
+        <details className="panel">
+          <summary><strong>Lender variants seen</strong> (GSCCCA grouped filings under these names)</summary>
+          <table className="compact">
+            <thead><tr><th>Source lender</th><th>Variant name</th><th>Instruments</th></tr></thead>
+            <tbody>
+              {response.perQuery.flatMap(q =>
+                (q.variants || []).map((v, i) => (
+                  <tr key={`${q.lender}-${i}`}>
+                    <td><code>{q.lender}</code></td>
+                    <td>{v.secured_party_name}</td>
+                    <td>{v.instrument_count}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </details>
       )}
 
@@ -297,10 +294,7 @@ export default function App() {
           <h3>Leads ({leads.length})</h3>
           <table>
             <thead>
-              <tr>
-                <th>Debtor</th><th>File #</th><th>Filed</th><th>Type</th>
-                <th>Secured Party</th><th>County</th><th>Status</th><th>Source lender</th>
-              </tr>
+              <tr><th>Debtor</th><th>File #</th><th>Filed</th><th>Type</th><th>Secured Party</th><th>County</th><th>Status</th><th>Source</th></tr>
             </thead>
             <tbody>
               {leads.slice(0, 500).map((l, i) => (
@@ -317,15 +311,11 @@ export default function App() {
               ))}
             </tbody>
           </table>
-          {leads.length > 500 && <div className="meta muted">Showing first 500 of {leads.length}. CSV export has the full list.</div>}
         </>
       )}
 
       <footer>
-        <p>
-          Source: GSCCCA Georgia UCC Index (search.gsccca.org). Uses your free GSCCCA limited-use account.
-          Respect their ToS — keep batches reasonable.
-        </p>
+        <p>Source: GSCCCA Georgia UCC Index. Uses Firecrawl (real browser session) + your free GSCCCA limited-use account.</p>
       </footer>
     </div>
   );
