@@ -40,6 +40,9 @@ export async function handler(event) {
     .replace(/\s+(LLC|INC\.?|CORP\.?|CORPORATION|L\.L\.C\.?|L\.P\.?|LP|LLP|CO\.?)$/i, '')
     .trim();
 
+  const t0 = Date.now();
+  console.log(`[apollo] search businessName="${businessName}" searchName="${searchName}"`);
+
   let res;
   try {
     res = await fetch(APOLLO_PEOPLE_SEARCH, {
@@ -57,29 +60,37 @@ export async function handler(event) {
       }),
     });
   } catch (err) {
-    return json(502, { status: 'error', error: `Apollo request failed: ${err.message}` });
+    console.error(`[apollo] fetch threw for "${searchName}": ${err.message}`);
+    return json(502, { status: 'error', error: `Apollo request failed: ${err.message}`, searchedName: searchName });
   }
 
   const raw = await res.text();
   let data;
   try { data = JSON.parse(raw); } catch {
-    return json(502, { status: 'error', error: 'Apollo returned non-JSON', body: raw.slice(0, 300) });
+    console.error(`[apollo] non-JSON response for "${searchName}" (HTTP ${res.status}): ${raw.slice(0, 200)}`);
+    return json(502, { status: 'error', error: `Apollo returned non-JSON (HTTP ${res.status})`, body: raw.slice(0, 300), searchedName: searchName });
   }
 
   if (!res.ok) {
+    const errMsg = stringifyApolloError(data) || `Apollo HTTP ${res.status}`;
+    console.error(`[apollo] HTTP ${res.status} for "${searchName}": ${errMsg}`);
     return json(200, {
       status: 'apollo_error',
       httpStatus: res.status,
-      error: data.error || data.message || data.errors || `Apollo HTTP ${res.status}`,
+      error: errMsg,
+      searchedName: searchName,
       raw: data,
     });
   }
 
   const people = data.people || data.contacts || [];
+  const totalEntries = data.pagination?.total_entries ?? null;
+  console.log(`[apollo] "${searchName}" → ${people.length} people, total_entries=${totalEntries}, ${Date.now() - t0}ms`);
   if (!people.length) {
     return json(200, {
       status: 'no_match',
-      message: `Apollo found no matching people at organizations named "${searchName}".`,
+      message: `Apollo has no owner/founder/CEO contacts for any organization named "${searchName}". Common for small LLCs not indexed in Apollo.`,
+      searchedName: searchName,
       pagination: data.pagination || null,
     });
   }
@@ -133,4 +144,17 @@ export async function handler(event) {
 
 function json(statusCode, body) {
   return { statusCode, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+}
+
+// Apollo's error shape varies: { error: "..." }, { message: "..." },
+// { errors: ["..."] }, or { errors: [{ message: "..." }] }. Flatten to a string.
+function stringifyApolloError(data) {
+  if (!data) return '';
+  if (typeof data.error === 'string') return data.error;
+  if (typeof data.message === 'string') return data.message;
+  if (Array.isArray(data.errors)) {
+    return data.errors.map(e => typeof e === 'string' ? e : (e?.message || JSON.stringify(e))).join('; ');
+  }
+  if (typeof data.errors === 'string') return data.errors;
+  return '';
 }

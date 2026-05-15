@@ -304,12 +304,16 @@ export default function App() {
           entry.batch = { status: 'skipped', reason: 'No owner identified by Apollo — Batch needs a first/last name' };
         }
       }
-      // Mark final enrichment status: 'ok' only if at least one source actually
-      // succeeded. 'error' means everything we tried failed (so the user can
-       // retry without clearing cache).
+      // Mark final enrichment status:
+      //   'ok'        — at least one source returned data
+      //   'no_match'  — Apollo returned 0 people (legitimate coverage gap, not an error)
+      //   'error'     — HTTP failure, network failure, missing API key, etc.
       const apolloOk = entry.apollo?.status === 'ok';
       const batchOk = entry.batch?.status === 'ok';
-      entry.status = (apolloOk || batchOk) ? 'ok' : 'error';
+      const apolloNoMatch = entry.apollo?.status === 'no_match';
+      if (apolloOk || batchOk) entry.status = 'ok';
+      else if (apolloNoMatch && !entry.batch?.error) entry.status = 'no_match';
+      else entry.status = 'error';
       acc[key] = entry;
       setEnrichment({ ...acc });
     }
@@ -342,13 +346,32 @@ export default function App() {
       enrich_status: e.status || '',
     };
   }
-  // Aggregate enrichment errors so the user can see what's failing.
-  const enrichErrors = Object.values(enrichment)
-    .filter(e => e.status === 'error' || e.apollo?.status === 'org_enrich_failed' || e.apollo?.error)
-    .map(e => e.apollo?.error || e.batch?.error || 'Unknown enrichment error')
-    .filter(Boolean);
+  // Per-lead failure detail so the user can actually see what's failing.
+  // Each row: { name, fileNumber, kind: 'error'|'no_match', detail, httpStatus? }
+  const enrichFailures = Object.entries(enrichment)
+    .filter(([, e]) => e.status === 'error' || e.status === 'no_match')
+    .map(([key, e]) => {
+      const [fileNumber, name] = key.split('|');
+      const apolloMsg = e.apollo?.error || e.apollo?.message || '';
+      const batchMsg = e.batch?.error || '';
+      const httpStatus = e.apollo?.httpStatus || null;
+      const apolloStatus = e.apollo?.status || '';
+      let detail =
+        apolloStatus === 'no_match' ? apolloMsg || 'Apollo: no people indexed for this business.' :
+        apolloStatus === 'apollo_error' ? `Apollo ${httpStatus || 'error'}: ${apolloMsg}` :
+        apolloStatus === 'error' ? `Apollo network/parse error: ${apolloMsg}` :
+        batchMsg ? `BatchData: ${batchMsg}` :
+        apolloMsg || batchMsg || `Unrecognized enrichment state (apollo.status="${apolloStatus}")`;
+      return { name, fileNumber, kind: e.status, detail, httpStatus, apolloStatus };
+    });
   const enrichSuccess = Object.values(enrichment).filter(e => e.status === 'ok').length;
+  const enrichNoMatch = Object.values(enrichment).filter(e => e.status === 'no_match').length;
   const enrichFailed = Object.values(enrichment).filter(e => e.status === 'error').length;
+  // Only suggest the API-key fix when we see HTTP errors that actually look auth-related.
+  const looksLikeAuthIssue = enrichFailures.some(f =>
+    f.httpStatus === 401 || f.httpStatus === 403 ||
+    /api[_-]?key|unauthorized|authentication/i.test(f.detail || '')
+  );
 
   // Aggregate + dedupe (on file_number + debtor_name) + filter by doc type.
   const allLeads = (() => {
@@ -743,21 +766,41 @@ export default function App() {
               Enriching <strong>{enrichProgress.current}</strong> of <strong>{enrichProgress.total}</strong> — current: <code>{enrichProgress.lender}</code>
             </div>
           )}
-          {(enrichSuccess > 0 || enrichFailed > 0) && (
+          {(enrichSuccess > 0 || enrichNoMatch > 0 || enrichFailed > 0) && (
             <div style={{ marginTop: '0.75rem', padding: '0.6rem 0.8rem', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '6px' }}>
               <div className="small-text">
                 <strong>Enrichment summary:</strong>{' '}
                 <span style={{ color: 'var(--good)' }}>✓ {enrichSuccess} succeeded</span>
+                {enrichNoMatch > 0 && <>{' · '}<span className="muted">○ {enrichNoMatch} not in Apollo</span></>}
                 {enrichFailed > 0 && <>{' · '}<span style={{ color: 'var(--error)' }}>✗ {enrichFailed} failed</span></>}
               </div>
-              {enrichErrors.length > 0 && (
-                <details style={{ marginTop: '0.4rem' }}>
-                  <summary className="small-text" style={{ color: 'var(--error)' }}>Error details ({enrichErrors.length})</summary>
+              {enrichFailures.length > 0 && (
+                <details style={{ marginTop: '0.4rem' }} open>
+                  <summary className="small-text" style={{ color: enrichFailed > 0 ? 'var(--error)' : 'var(--muted)' }}>
+                    Details ({enrichFailures.length})
+                  </summary>
                   <ul className="log" style={{ marginTop: '0.3rem' }}>
-                    {[...new Set(enrichErrors)].slice(0, 10).map((err, i) => <li key={i}>{err}</li>)}
+                    {enrichFailures.slice(0, 30).map((f, i) => (
+                      <li key={i}>
+                        <strong>{f.name || f.fileNumber}</strong>
+                        {f.kind === 'no_match' ? ' — ' : <span style={{ color: 'var(--error)' }}> — </span>}
+                        {f.detail}
+                      </li>
+                    ))}
+                    {enrichFailures.length > 30 && <li className="muted">…and {enrichFailures.length - 30} more</li>}
                   </ul>
+                  {enrichNoMatch > 0 && enrichFailed === 0 && (
+                    <p className="hint" style={{ marginTop: '0.4rem' }}>
+                      "Not in Apollo" is normal for small/one-person LLCs — Apollo's data skews toward established businesses with public LinkedIn footprints. This isn't a bug, it's a coverage gap.
+                    </p>
+                  )}
+                  {looksLikeAuthIssue && (
+                    <p className="hint" style={{ marginTop: '0.4rem' }}>
+                      The HTTP 401/403 above suggests an auth problem: check that <code>APOLLO_API_KEY</code> is set in Netlify (Site configuration → Environment variables) and that the key has Master API access enabled in Apollo. Trigger a new deploy after changing env vars.
+                    </p>
+                  )}
                   <p className="hint" style={{ marginTop: '0.4rem' }}>
-                    Most common cause: <code>APOLLO_API_KEY</code> not set in Netlify. Add it under Site configuration → Environment variables, then trigger a new deploy.
+                    For more diagnostics see the Netlify Functions log (logs prefixed <code>[apollo]</code>).
                   </p>
                 </details>
               )}
