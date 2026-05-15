@@ -75,10 +75,19 @@ export default function App() {
   // small LLCs Apollo doesn't index; Apollo catches established businesses
   // with LinkedIn/web footprints. BatchData chains off either to get the
   // owner's personal cell + email.
-  const [enrichSources, setEnrichSources] = useState({ gasos: true, apollo: true, batch: true });
+  const [enrichSources, setEnrichSources] = useState({
+    gasos: true, apollo: true, scrapecreators: false, hunter: false, batch: true,
+  });
   // Apollo reveal flags. Email is cheap (~1 credit), phone is expensive
   // (~8 credits) — phone is opt-in.
   const [apolloReveal, setApolloReveal] = useState({ email: true, phone: false });
+  // Sub-options for ScrapeCreators — controls per-lead credit cost.
+  // findDomain: try to find company website domain via Google search
+  // findLinkedIn: try to find owner's LinkedIn profile URL via Google search
+  // fetchProfile: also fetch the full LinkedIn profile (extra credit per hit)
+  const [scOptions, setScOptions] = useState({ findDomain: true, findLinkedIn: true, fetchProfile: false });
+  // Sub-option for Hunter — verify email deliverability (extra credit per email)
+  const [hunterOptions, setHunterOptions] = useState({ verify: false });
   const enrichCancelRef = useRef(false);
 
   const [running, setRunning] = useState(false);
@@ -327,6 +336,69 @@ export default function App() {
           entry.apollo = { status: 'error', error: err.message };
         }
       }
+      // ScrapeCreators step — uses Google search to find (a) the company's
+      // website domain and (b) the owner's LinkedIn profile URL. Runs BEFORE
+      // Hunter so its domain finding can feed Hunter's email lookup.
+      if (enrichSources.scrapecreators) {
+        const apolloOwner = entry.apollo?.status === 'ok' ? entry.apollo.owner : null;
+        const sosAgent =
+          entry.gasos?.status === 'ok' && !entry.gasos.registered_agent?.likely_commercial
+            ? entry.gasos.registered_agent
+            : null;
+        const firstName = apolloOwner?.first_name || sosAgent?.first_name || '';
+        const lastName = apolloOwner?.last_name || sosAgent?.last_name || '';
+        const apolloDomain =
+          entry.apollo?.business?.website?.replace(/^https?:\/\//i, '').split('/')[0] || '';
+        try {
+          const res = await fetch('/api/enrich-scrapecreators', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              companyName: l.debtor_name,
+              firstName,
+              lastName,
+              knownDomain: apolloDomain,
+              findDomain: scOptions.findDomain,
+              findLinkedIn: scOptions.findLinkedIn,
+              fetchProfile: scOptions.fetchProfile,
+            }),
+          });
+          entry.scrapecreators = await res.json();
+        } catch (err) {
+          entry.scrapecreators = { status: 'error', error: err.message };
+        }
+      }
+      // Hunter step — uses {first_name, last_name, domain} → business email.
+      // Domain comes from Apollo first, then ScrapeCreators. If neither found
+      // one, Hunter is skipped (can't run without a domain).
+      if (enrichSources.hunter) {
+        const apolloOwner = entry.apollo?.status === 'ok' ? entry.apollo.owner : null;
+        const sosAgent =
+          entry.gasos?.status === 'ok' && !entry.gasos.registered_agent?.likely_commercial
+            ? entry.gasos.registered_agent
+            : null;
+        const firstName = apolloOwner?.first_name || sosAgent?.first_name || '';
+        const lastName = apolloOwner?.last_name || sosAgent?.last_name || '';
+        const domain =
+          entry.apollo?.business?.website?.replace(/^https?:\/\//i, '').split('/')[0] ||
+          entry.scrapecreators?.domain || '';
+        if (!domain) {
+          entry.hunter = { status: 'skipped', reason: 'No company domain — enable ScrapeCreators (findDomain) or wait for Apollo to return one' };
+        } else if (!firstName && !lastName) {
+          entry.hunter = { status: 'skipped', reason: 'No first/last name from Apollo or GA SoS — Hunter needs a name' };
+        } else {
+          try {
+            const res = await fetch('/api/enrich-hunter', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ firstName, lastName, domain, verify: hunterOptions.verify }),
+            });
+            entry.hunter = await res.json();
+          } catch (err) {
+            entry.hunter = { status: 'error', error: err.message };
+          }
+        }
+      }
       // BatchData skip-trace — chains off whichever source produced a usable
       // first/last name. Apollo wins when both have a name (more likely the
       // true owner). SoS registered agent is a fallback unless flagged as
@@ -370,7 +442,7 @@ export default function App() {
       //   'ok'        — at least one source returned usable data
       //   'no_match'  — none of the sources errored, but none found data
       //   'error'     — at least one source actually errored (HTTP/auth/etc.)
-      const sources = [entry.gasos, entry.apollo, entry.batch].filter(Boolean);
+      const sources = [entry.gasos, entry.apollo, entry.scrapecreators, entry.hunter, entry.batch].filter(Boolean);
       const anyOk = sources.some(s => s?.status === 'ok');
       const anyError = sources.some(s => s?.status === 'error' || s?.status === 'apollo_error');
       if (anyOk) entry.status = 'ok';
@@ -409,18 +481,26 @@ export default function App() {
     const ownerName =
       apolloOwner?.full_name ||
       (sosAgentUsable ? sosAgent.full_name : '');
+    const hunterEmail = e.hunter?.status === 'ok' ? e.hunter.email : '';
+    const hunterScore = e.hunter?.status === 'ok' ? e.hunter.score : null;
+    const hunterVerify = e.hunter?.verification || null;
+    const scResult = e.scrapecreators || null;
     return {
       business_phone: e.apollo?.business?.phone || '',
-      business_website: e.apollo?.business?.website || '',
+      business_website: e.apollo?.business?.website || scResult?.domain || '',
       industry: e.apollo?.business?.industry || '',
       owner_name: ownerName,
       owner_title: apolloOwner?.title || (sosAgentUsable ? 'Registered Agent (GA SoS)' : ''),
-      owner_email: apolloOwner?.email || '',
+      // owner_email picks the most reliable: Apollo's verified > Hunter's >
+      // Batch's personal email. UI and merged CSV use this.
+      owner_email: apolloOwner?.email || hunterEmail || '',
       owner_phone_business: apolloOwner?.phone || '',
       owner_mobile: e.batch?.person?.mobile || '',
       owner_landline: e.batch?.person?.landline || '',
       owner_personal_email: e.batch?.person?.email || '',
       owner_address: e.batch?.person?.current_address || sosBusiness?.principal_address || '',
+      // LinkedIn URL — Apollo's first, then ScrapeCreators' Google-search find.
+      owner_linkedin: apolloOwner?.linkedin_url || scResult?.linkedin_url || '',
       // Apollo source columns — always populated when Apollo found someone.
       apollo_owner_name: apolloOwner?.full_name || '',
       apollo_owner_first: apolloOwner?.first_name || '',
@@ -438,11 +518,25 @@ export default function App() {
       sos_agent_first: sosAgent?.first_name || '',
       sos_agent_last: sosAgent?.last_name || '',
       sos_agent_is_commercial: sosAgent?.likely_commercial ? 'yes' : '',
+      // ScrapeCreators columns
+      sc_domain: scResult?.domain || '',
+      sc_domain_source: scResult?.domainSource || '',
+      sc_linkedin_url: scResult?.linkedin_url || '',
+      sc_linkedin_title: scResult?.linkedin_title || '',
+      sc_linkedin_headline: scResult?.profile?.headline || '',
+      // Hunter columns
+      hunter_email: hunterEmail,
+      hunter_score: hunterScore != null ? String(hunterScore) : '',
+      hunter_position: e.hunter?.position || '',
+      hunter_verify_result: hunterVerify?.result || '',
+      hunter_verify_score: hunterVerify?.score != null ? String(hunterVerify.score) : '',
       // Per-source statuses for debugging in exports
       gasos_status: e.gasos?.status || '',
       gasos_error: e.gasos?.error || '',
       apollo_status: e.apollo?.status || '',
       apollo_error: e.apollo?.error || '',
+      sc_status: e.scrapecreators?.status || '',
+      hunter_status: e.hunter?.status || '',
       batch_status: e.batch?.status || '',
       batch_error: e.batch?.error || '',
       enrich_status: e.status || '',
@@ -461,47 +555,52 @@ export default function App() {
     const sosAgent = e.gasos?.status === 'ok' ? e.gasos.registered_agent : null;
     const sosBusiness = e.gasos?.status === 'ok' ? e.gasos.business : null;
     const batchPerson = e.batch?.status === 'ok' ? e.batch.person : null;
-    // BatchData was run on whichever name we passed it in enrichAll(). Today
-    // that's Apollo-first then SoS-agent. So attach Batch to the matching
-    // source. If names disagree this could be slightly off — defensive but
-    // not perfect; the Raw CSV's explicit batch_* columns still show the
-    // ground truth.
-    const batchAttachedTo =
-      apolloOwner?.first_name && batchPerson?.first_name &&
-      apolloOwner.first_name.toLowerCase() === (batchPerson.first_name || '').toLowerCase()
-        ? 'apollo'
-        : sosAgent?.first_name && batchPerson?.first_name &&
-          sosAgent.first_name.toLowerCase() === (batchPerson.first_name || '').toLowerCase()
-          ? 'sos'
-          : (apolloOwner ? 'apollo' : 'sos');
+    const hunterEmail = e.hunter?.status === 'ok' ? e.hunter.email : '';
+    const scLi = e.scrapecreators?.linkedin_url || '';
+    // The chained sources (ScrapeCreators, Hunter, BatchData) all run on ONE
+    // name — Apollo's first, else SoS-agent's. So those enrichments attach to
+    // whichever source supplied the name we ran them against.
+    const chainedTo = apolloOwner ? 'apollo' : (sosAgent && !sosAgent.likely_commercial ? 'sos-agent' : null);
 
     const contacts = [];
     if (apolloOwner) {
-      const isBatch = batchAttachedTo === 'apollo' && batchPerson;
+      const isChained = chainedTo === 'apollo';
       contacts.push({
         source: 'apollo',
         first_name: apolloOwner.first_name || '',
         last_name: apolloOwner.last_name || '',
         title: apolloOwner.title || '',
-        email: apolloOwner.email || (isBatch ? batchPerson.email : '') || '',
-        phone: (isBatch ? batchPerson.mobile : '') || apolloOwner.phone || (isBatch ? batchPerson.landline : '') || '',
-        mobile: isBatch ? batchPerson.mobile : '',
-        landline: isBatch ? batchPerson.landline : '',
-        address: (isBatch ? batchPerson.current_address : '') || sosBusiness?.principal_address || '',
+        email: apolloOwner.email
+          || (isChained ? hunterEmail : '')
+          || (isChained && batchPerson ? batchPerson.email : '')
+          || '',
+        phone: (isChained && batchPerson ? batchPerson.mobile : '')
+          || apolloOwner.phone
+          || (isChained && batchPerson ? batchPerson.landline : '')
+          || '',
+        mobile: isChained && batchPerson ? batchPerson.mobile : '',
+        landline: isChained && batchPerson ? batchPerson.landline : '',
+        address: (isChained && batchPerson ? batchPerson.current_address : '') || sosBusiness?.principal_address || '',
+        linkedin_url: apolloOwner.linkedin_url || (isChained ? scLi : ''),
       });
     }
     if (sosAgent && !sosAgent.likely_commercial) {
-      const isBatch = batchAttachedTo === 'sos' && batchPerson;
+      const isChained = chainedTo === 'sos-agent';
       contacts.push({
         source: 'sos-agent',
         first_name: sosAgent.first_name || '',
         last_name: sosAgent.last_name || '',
         title: 'Registered Agent (GA SoS)',
-        email: isBatch ? (batchPerson.email || '') : '',
-        phone: (isBatch ? batchPerson.mobile : '') || (isBatch ? batchPerson.landline : '') || '',
-        mobile: isBatch ? batchPerson.mobile : '',
-        landline: isBatch ? batchPerson.landline : '',
-        address: (isBatch ? batchPerson.current_address : '') || sosBusiness?.principal_address || '',
+        email: (isChained ? hunterEmail : '')
+          || (isChained && batchPerson ? batchPerson.email : '')
+          || '',
+        phone: (isChained && batchPerson ? batchPerson.mobile : '')
+          || (isChained && batchPerson ? batchPerson.landline : '')
+          || '',
+        mobile: isChained && batchPerson ? batchPerson.mobile : '',
+        landline: isChained && batchPerson ? batchPerson.landline : '',
+        address: (isChained && batchPerson ? batchPerson.current_address : '') || sosBusiness?.principal_address || '',
+        linkedin_url: isChained ? scLi : '',
       });
     }
     return contacts;
@@ -544,6 +643,8 @@ export default function App() {
   // Per-source success counts for the summary breakdown.
   const sosOkCount = Object.values(enrichment).filter(e => e.gasos?.status === 'ok').length;
   const apolloOkCount = Object.values(enrichment).filter(e => e.apollo?.status === 'ok').length;
+  const scOkCount = Object.values(enrichment).filter(e => e.scrapecreators?.status === 'ok' && (e.scrapecreators?.domain || e.scrapecreators?.linkedin_url)).length;
+  const hunterOkCount = Object.values(enrichment).filter(e => e.hunter?.status === 'ok').length;
   const batchOkCount = Object.values(enrichment).filter(e => e.batch?.status === 'ok').length;
   // Only suggest the API-key fix when we see HTTP errors that actually look auth-related.
   const looksLikeAuthIssue = enrichFailures.some(f =>
@@ -591,16 +692,20 @@ export default function App() {
     const headers = [
       'file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender',
       'business_phone', 'business_website', 'industry',
-      // Apollo source columns (1st choice)
+      // Apollo source columns
       'apollo_owner_name', 'apollo_owner_first', 'apollo_owner_last', 'apollo_owner_title',
       'apollo_owner_email', 'apollo_owner_phone', 'apollo_owner_linkedin',
       // SoS source columns
       'sos_business_name', 'sos_status', 'sos_control_number', 'sos_principal_address',
       'sos_agent_name', 'sos_agent_first', 'sos_agent_last', 'sos_agent_is_commercial',
-      // BatchData skip-trace columns
+      // ScrapeCreators columns (Google → company domain + LinkedIn URL)
+      'sc_domain', 'sc_domain_source', 'sc_linkedin_url', 'sc_linkedin_title', 'sc_linkedin_headline',
+      // Hunter columns (name + domain → business email)
+      'hunter_email', 'hunter_score', 'hunter_position', 'hunter_verify_result', 'hunter_verify_score',
+      // BatchData skip-trace columns (personal phone/email/address)
       'owner_mobile', 'owner_landline', 'owner_personal_email', 'owner_address',
-      // Legacy merged owner view (best-pick) for backward compat
-      'owner_name', 'owner_title', 'owner_email', 'owner_phone',
+      // Merged best-pick view (used by table + GHL primary contact)
+      'owner_name', 'owner_title', 'owner_email', 'owner_phone', 'owner_linkedin',
     ];
     return [headers.join(','), ...rows.map(l => {
       const e = getEnriched(l) || {};
@@ -619,7 +724,7 @@ export default function App() {
     const headers = [
       'First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address',
       'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes',
-      'Apollo_Contact', 'SoS_Agent',
+      'Apollo_Contact', 'SoS_Agent', 'LinkedIn_URL', 'Email_Confidence',
     ];
     const userTags = customTags.split(',').map(t => t.trim()).filter(Boolean);
     const out = [headers.join(',')];
@@ -651,6 +756,11 @@ export default function App() {
         primary.email && 'has-email',
       ].filter(Boolean);
       const tags = [...autoTags, ...userTags].join('; ');
+      // Email-confidence rollup: prefer Hunter's verifier result, then Hunter's
+      // finder score, then a blank. GHL automations can route on this.
+      const emailConfidence = e.hunter_verify_result
+        || (e.hunter_score ? `hunter-score-${e.hunter_score}` : '')
+        || (primary.email && primary.source === 'apollo' && e.apollo_owner_email ? 'apollo-verified' : '');
       const noteParts = [
         notesPrefix && notesPrefix.trim(),
         `UCC #${l.file_number}`,
@@ -660,13 +770,14 @@ export default function App() {
         e.business_website && `Site: ${e.business_website}`,
         primary.title && `Title: ${primary.title}`,
         primary.landline && `Landline: ${primary.landline}`,
+        primary.linkedin_url && `LinkedIn: ${primary.linkedin_url}`,
       ].filter(Boolean);
       const notes = noteParts.join(' | ');
       out.push([
         primary.first_name, primary.last_name, primary.email, primary.phone,
         l.debtor_name, primary.address || '', '', 'GA', '', 'US',
         `GA UCC - ${l.source_lender}`, tags, notes,
-        apolloField, sosField,
+        apolloField, sosField, primary.linkedin_url || '', emailConfidence,
       ].map(csvCell).join(','));
     }
     return out.join('\n');
@@ -992,20 +1103,23 @@ export default function App() {
       {leads.length > 0 && (
         <div className="panel">
           <div className="csv-tabs" style={{ marginBottom: '0.5rem' }}>
-            <strong>🔎 Enrichment</strong>
-            <span className="muted small-text">GA SoS → Apollo → BatchData skip-trace</span>
+            <strong>🔎 Enrichment waterfall</strong>
+            <span className="muted small-text">GA SoS → Apollo → ScrapeCreators → Hunter → BatchData</span>
           </div>
           <p className="hint" style={{ marginBottom: '0.5rem' }}>
-            Chained enrichment for each lead. GA Secretary of State (free, public) catches small LLCs Apollo doesn't index. Apollo (~2 credits ≈ $0.20/lead) covers established businesses. BatchData skip-traces whichever owner name we found to a personal cell + email.
+            Each lead runs through the sources you enable, in order. Earlier sources feed later ones:
+            SoS finds the legal owner name, Apollo confirms title and may give a company website,
+            ScrapeCreators uses Google to fill in a missing domain and find the LinkedIn URL,
+            Hunter turns <code>name + domain</code> into a business email, and BatchData skip-traces a personal phone.
           </p>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.5rem' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', marginBottom: '0.5rem' }}>
             <label className="small-text">
               <input
                 type="checkbox"
                 checked={enrichSources.gasos}
                 onChange={e => setEnrichSources(s => ({ ...s, gasos: e.target.checked }))}
               />{' '}
-              <strong>GA SoS</strong> (free, registered agent + principal address)
+              <strong>1. GA SoS</strong> <span className="muted">— free; registered agent + principal address. Best for small LLCs Apollo doesn't index.</span>
             </label>
             <label className="small-text">
               <input
@@ -1013,7 +1127,23 @@ export default function App() {
                 checked={enrichSources.apollo}
                 onChange={e => setEnrichSources(s => ({ ...s, apollo: e.target.checked }))}
               />{' '}
-              <strong>Apollo</strong> (~2 credits/lead)
+              <strong>2. Apollo</strong> <span className="muted">— ~1 API call free, +1 email credit per unlock. CEO/owner title match + company website.</span>
+            </label>
+            <label className="small-text">
+              <input
+                type="checkbox"
+                checked={enrichSources.scrapecreators}
+                onChange={e => setEnrichSources(s => ({ ...s, scrapecreators: e.target.checked }))}
+              />{' '}
+              <strong>3. ScrapeCreators</strong> <span className="muted">— ~1–3 credits/lead. Fills missing company domain (so Hunter can work) and finds LinkedIn URL via Google search.</span>
+            </label>
+            <label className="small-text">
+              <input
+                type="checkbox"
+                checked={enrichSources.hunter}
+                onChange={e => setEnrichSources(s => ({ ...s, hunter: e.target.checked }))}
+              />{' '}
+              <strong>4. Hunter</strong> <span className="muted">— 1 credit per email + 1 if verifying. Business email from <code>name + domain</code>. Skipped when no domain is known.</span>
             </label>
             <label className="small-text">
               <input
@@ -1021,11 +1151,11 @@ export default function App() {
                 checked={enrichSources.batch}
                 onChange={e => setEnrichSources(s => ({ ...s, batch: e.target.checked }))}
               />{' '}
-              <strong>BatchData</strong> skip-trace
+              <strong>5. BatchData</strong> <span className="muted">— skip-trace; turns owner name + state into personal mobile, landline, email, current address.</span>
             </label>
           </div>
           {enrichSources.apollo && (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.75rem', paddingLeft: '1rem' }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.5rem', paddingLeft: '1.5rem' }}>
               <label className="small-text muted">
                 <input
                   type="checkbox"
@@ -1035,13 +1165,48 @@ export default function App() {
                 Apollo: reveal owner email (~1 credit/result)
               </label>
               <label className="small-text muted" title="Apollo delivers phone unlocks asynchronously via webhook — we haven't wired up a webhook receiver yet, so this toggle is disabled.">
+                <input type="checkbox" checked={false} disabled onChange={() => {}} />{' '}
+                Apollo: reveal owner phone <em>(disabled — needs webhook receiver)</em>
+              </label>
+            </div>
+          )}
+          {enrichSources.scrapecreators && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.5rem', paddingLeft: '1.5rem' }}>
+              <label className="small-text muted">
                 <input
                   type="checkbox"
-                  checked={false}
-                  disabled
-                  onChange={() => {}}
+                  checked={scOptions.findDomain}
+                  onChange={e => setScOptions(o => ({ ...o, findDomain: e.target.checked }))}
                 />{' '}
-                Apollo: reveal owner phone <em>(disabled — requires webhook receiver, not yet built)</em>
+                Find company domain via Google (1 credit; skipped if Apollo already gave us one)
+              </label>
+              <label className="small-text muted">
+                <input
+                  type="checkbox"
+                  checked={scOptions.findLinkedIn}
+                  onChange={e => setScOptions(o => ({ ...o, findLinkedIn: e.target.checked }))}
+                />{' '}
+                Find LinkedIn URL via Google (1 credit)
+              </label>
+              <label className="small-text muted" title="Fetches the full LinkedIn profile (headline, location, current role) via ScrapeCreators. Extra credit per lead.">
+                <input
+                  type="checkbox"
+                  checked={scOptions.fetchProfile}
+                  onChange={e => setScOptions(o => ({ ...o, fetchProfile: e.target.checked }))}
+                />{' '}
+                Also fetch full LinkedIn profile (+1 credit per LinkedIn hit)
+              </label>
+            </div>
+          )}
+          {enrichSources.hunter && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.5rem', paddingLeft: '1.5rem' }}>
+              <label className="small-text muted" title="Runs the email through Hunter's verifier so you don't push undeliverable addresses into GHL. Extra credit per email.">
+                <input
+                  type="checkbox"
+                  checked={hunterOptions.verify}
+                  onChange={e => setHunterOptions(o => ({ ...o, verify: e.target.checked }))}
+                />{' '}
+                Verify email deliverability (+1 credit per email; result lands in <code>Email_Confidence</code>)
               </label>
             </div>
           )}
@@ -1050,7 +1215,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={enrichAll}
-                disabled={!enrichSources.gasos && !enrichSources.apollo && !enrichSources.batch}
+                disabled={!Object.values(enrichSources).some(Boolean)}
               >
                 Enrich {uniqueLeadsToEnrich} unique lead{uniqueLeadsToEnrich === 1 ? '' : 's'}
               </button>
@@ -1073,7 +1238,7 @@ export default function App() {
                 {enrichFailed > 0 && <>{' · '}<span style={{ color: 'var(--error)' }}>✗ {enrichFailed} failed</span></>}
               </div>
               <div className="small-text muted" style={{ marginTop: '0.2rem' }}>
-                By source: GA SoS {sosOkCount} · Apollo {apolloOkCount} · BatchData {batchOkCount}
+                By source: GA SoS {sosOkCount} · Apollo {apolloOkCount} · ScrapeCreators {scOkCount} · Hunter {hunterOkCount} · BatchData {batchOkCount}
               </div>
               {enrichFailures.length > 0 && (
                 <details style={{ marginTop: '0.4rem' }} open>
