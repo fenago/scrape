@@ -911,13 +911,14 @@ export default function App() {
                 />{' '}
                 Apollo: reveal owner email (~1 credit/result)
               </label>
-              <label className="small-text muted">
+              <label className="small-text muted" title="Apollo delivers phone unlocks asynchronously via webhook — we haven't wired up a webhook receiver yet, so this toggle is disabled.">
                 <input
                   type="checkbox"
-                  checked={apolloReveal.phone}
-                  onChange={e => setApolloReveal(r => ({ ...r, phone: e.target.checked }))}
+                  checked={false}
+                  disabled
+                  onChange={() => {}}
                 />{' '}
-                Apollo: reveal owner phone (~8 credits/result — expensive)
+                Apollo: reveal owner phone <em>(disabled — requires webhook receiver, not yet built)</em>
               </label>
             </div>
           )}

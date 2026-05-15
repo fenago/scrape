@@ -1,19 +1,29 @@
-// Apollo.io enrichment via Mixed People Search.
+// Apollo.io enrichment — two-step flow.
 //
-// Apollo's /organizations/enrich endpoint REQUIRES a domain (not a name) and
-// is for enriching an org you already know the domain of. For our use case
-// (we have a debtor business NAME, not a domain), the right endpoint is
-// /mixed_people/api_search with q_organization_name — one call returns both
-// the org details and the matching people (owners/founders/CEOs).
+// Step 1: /mixed_people/api_search with q_organization_name → finds the best-fit
+//         person at that org. This endpoint returns ONLY obfuscated data
+//         (first_name, last_name_obfuscated, title, has_email boolean) — no
+//         actual email or phone. By design — Apollo gates contact data behind
+//         the enrichment endpoint as of their 2024 API rework.
 //
-// Note: Apollo deprecated /mixed_people/search for API callers in 2024 and
-// replaced it with /mixed_people/api_search. Same payload shape.
+// Step 2 (only if revealEmail/revealPhone): /people/match with the person's id
+//         + reveal_personal_emails:true → unlocked first/last name + email.
+//         Costs 1 email credit per unlock on Apollo's plan.
 //
-// Apollo docs: https://docs.apollo.io/reference/people-api-search
+// IMPORTANT: reveal_phone_number on /people/match is ASYNCHRONOUS — it
+// requires a webhook_url parameter and Apollo POSTs the phone to that URL
+// minutes later. We don't have a webhook receiver yet, so phone reveal is
+// not wired up. The revealPhone request flag is accepted but ignored.
+//
+// Apollo docs:
+//   https://docs.apollo.io/reference/people-api-search
+//   https://docs.apollo.io/reference/people-enrichment
+//
 // Auth: X-Api-Key header. Get a key at https://app.apollo.io/#/settings/integrations/api
 // Required Netlify env var: APOLLO_API_KEY
 
 const APOLLO_PEOPLE_SEARCH = 'https://api.apollo.io/api/v1/mixed_people/api_search';
+const APOLLO_PEOPLE_MATCH  = 'https://api.apollo.io/api/v1/people/match';
 
 const OWNER_TITLES = [
   'founder', 'co-founder', 'cofounder', 'owner', 'co-owner', 'president',
@@ -33,10 +43,12 @@ export async function handler(event) {
   const businessName = (body.businessName || '').trim();
   if (!businessName) return json(400, { error: 'businessName is required' });
 
-  // Reveal flags. Defaults: reveal email (cheap, ~1 credit), do NOT reveal
-  // phone (expensive, ~8 credits per result). Caller can opt-in to phone.
+  // Reveal flags. Email = synchronous (~1 credit per unlock on Apollo plan).
+  // Phone = ignored for now — Apollo's reveal_phone_number is async via
+  // webhook, which we don't have wired up yet. Pass-through left in place
+  // so the UI toggle keeps working when we add a webhook receiver.
   const revealEmail = body.revealEmail !== false;
-  const revealPhone = body.revealPhone === true;
+  const revealPhone = false; // body.revealPhone — disabled, see header note
 
   // Strip common LLC/INC/CORP suffixes — Apollo's name match works better
   // against the bare brand than against the legal entity form.
@@ -58,12 +70,12 @@ export async function handler(event) {
         'X-Api-Key': apiKey,
       },
       body: JSON.stringify({
+        // Search endpoint ignores reveal_* flags — those are documented only
+        // on /people/match. Don't waste them here.
         q_organization_name: searchName,
         person_titles: OWNER_TITLES,
         page: 1,
         per_page: 10,
-        reveal_personal_emails: revealEmail,
-        reveal_phone_number: revealPhone,
       }),
     });
   } catch (err) {
@@ -114,8 +126,40 @@ export async function handler(event) {
     return 1;
   };
   const sorted = [...people].sort((a, b) => score(b) - score(a));
-  const owner = sorted[0];
+  let owner = sorted[0];
   const org = owner.organization || {};
+
+  // Apollo's search endpoint silently ignores reveal_personal_emails and
+  // reveal_phone_number — those flags are only honored on /people/match.
+  // So if reveal is requested, fire a second call against the matched
+  // person's id. Costs ~1 extra credit per unlock; requires API access
+  // tier on the Apollo account.
+  let matchData = null;
+  if ((revealEmail || revealPhone) && owner.id) {
+    try {
+      const mres = await fetch(APOLLO_PEOPLE_MATCH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'X-Api-Key': apiKey },
+        body: JSON.stringify({
+          id: owner.id,
+          reveal_personal_emails: revealEmail,
+          reveal_phone_number: revealPhone,
+        }),
+      });
+      const mraw = await mres.text();
+      try { matchData = JSON.parse(mraw); } catch { matchData = null; }
+      if (!mres.ok) {
+        console.error(`[apollo] /people/match HTTP ${mres.status} for id=${owner.id}: ${mraw.slice(0, 200)}`);
+      } else if (matchData?.person) {
+        // Merge unlocked fields onto the search result. Keep the search
+        // record's title/org for context.
+        owner = { ...owner, ...matchData.person };
+        console.log(`[apollo] unlocked id=${owner.id}: hasEmail=${!!pickEmail(owner)}, hasPhone=${!!(owner.phone_numbers?.length || owner.mobile_phone)}`);
+      }
+    } catch (err) {
+      console.error(`[apollo] /people/match threw for id=${owner.id}: ${err.message}`);
+    }
+  }
 
   return json(200, {
     status: 'ok',
