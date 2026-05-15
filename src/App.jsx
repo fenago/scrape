@@ -31,6 +31,8 @@ const DOC_TYPES = [
 
 const DEFAULT_DOC_TYPES = ['Original', 'Amendment', 'Continuation'];
 
+const DEFAULT_LENDERS = ['CELTIC BANK'];
+
 const TIME_WINDOWS = [
   { id: '7d',   label: 'Last 7 days',   days: 7 },
   { id: '30d',  label: 'Last 30 days',  days: 30 },
@@ -64,7 +66,9 @@ export default function App() {
   const [enrichment, setEnrichment] = useState({});
   const [enriching, setEnriching] = useState(false);
   const [enrichProgress, setEnrichProgress] = useState(null);
-  const [enrichSources, setEnrichSources] = useState({ apollo: true, batch: true });
+  // BatchData disabled by default per user preference (too expensive).
+  // The /api/enrich-batch function still exists; flip batch:true here to re-enable.
+  const [enrichSources, setEnrichSources] = useState({ apollo: true, batch: false });
   const enrichCancelRef = useRef(false);
 
   const [running, setRunning] = useState(false);
@@ -349,12 +353,12 @@ export default function App() {
     const headers = [
       'file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender',
       'business_phone', 'business_website', 'industry',
-      'owner_name', 'owner_title', 'owner_email', 'owner_phone_business',
-      'owner_mobile', 'owner_landline', 'owner_personal_email', 'owner_address',
+      'owner_name', 'owner_title', 'owner_email', 'owner_phone',
     ];
     return [headers.join(','), ...rows.map(l => {
       const e = getEnriched(l) || {};
-      return headers.map(h => csvCell(l[h] !== undefined ? l[h] : e[h])).join(',');
+      const merged = { ...e, owner_phone: e.owner_phone_business || e.owner_mobile || e.owner_landline || '' };
+      return headers.map(h => csvCell(l[h] !== undefined ? l[h] : merged[h])).join(',');
     })].join('\n');
   }
   function ghlCsv(rows) {
@@ -692,24 +696,18 @@ export default function App() {
       {leads.length > 0 && (
         <div className="panel">
           <div className="csv-tabs" style={{ marginBottom: '0.5rem' }}>
-            <strong>🔎 Skip tracing / enrichment</strong>
-            <div className="chips">
-              <button type="button" className={`chip ${enrichSources.apollo ? 'on' : ''}`} onClick={() => setEnrichSources(s => ({ ...s, apollo: !s.apollo }))}>
-                Apollo.io {enrichSources.apollo ? '✓' : ''}
-              </button>
-              <button type="button" className={`chip ${enrichSources.batch ? 'on' : ''}`} onClick={() => setEnrichSources(s => ({ ...s, batch: !s.batch }))}>
-                BatchData (skip trace) {enrichSources.batch ? '✓' : ''}
-              </button>
-            </div>
+            <strong>🔎 Enrichment (Apollo.io)</strong>
+            <span className="muted small-text">Finds owner name, business email, business phone, industry</span>
           </div>
           <p className="hint" style={{ marginBottom: '0.75rem' }}>
-            <strong>Apollo</strong> finds the business + owner name + business email. <strong>BatchData</strong> skip-traces the owner's personal cell + email + home address (needs Apollo first to identify the owner, OR works alone if the debtor field already contains a person's name).
-            Each enrichment costs ~$0.05–$0.30 per lead.
+            For each lead, Apollo runs 2 calls (org enrich + people search at that org) to find the owner/founder/CEO. ~2 credits per lead ≈ $0.20.
+            Coverage typically 40–70% — better for established businesses, weaker for one-person LLCs.
+            Requires <code>APOLLO_API_KEY</code> env var set in Netlify.
           </p>
           <div className="submit-row" style={{ paddingTop: 0, borderTop: 'none' }}>
             {!enriching ? (
-              <button type="button" onClick={enrichAll} disabled={!enrichSources.apollo && !enrichSources.batch}>
-                Enrich {leads.filter(l => enrichment[leadKey(l)]?.status !== 'ok').length} lead{leads.length === 1 ? '' : 's'}
+              <button type="button" onClick={enrichAll}>
+                Enrich {leads.filter(l => enrichment[leadKey(l)]?.status !== 'ok').length} lead{leads.length === 1 ? '' : 's'} with Apollo
               </button>
             ) : (
               <button type="button" onClick={cancelEnrich}>Stop enrichment</button>
