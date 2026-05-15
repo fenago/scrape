@@ -299,7 +299,12 @@ export default function App() {
           entry.batch = { status: 'skipped', reason: 'No owner identified by Apollo — Batch needs a first/last name' };
         }
       }
-      entry.status = 'ok';
+      // Mark final enrichment status: 'ok' only if at least one source actually
+      // succeeded. 'error' means everything we tried failed (so the user can
+       // retry without clearing cache).
+      const apolloOk = entry.apollo?.status === 'ok';
+      const batchOk = entry.batch?.status === 'ok';
+      entry.status = (apolloOk || batchOk) ? 'ok' : 'error';
       acc[key] = entry;
       setEnrichment({ ...acc });
     }
@@ -326,9 +331,19 @@ export default function App() {
       owner_personal_email: e.batch?.person?.email || '',
       owner_address: e.batch?.person?.current_address || '',
       apollo_status: e.apollo?.status || '',
+      apollo_error: e.apollo?.error || '',
       batch_status: e.batch?.status || '',
+      batch_error: e.batch?.error || '',
+      enrich_status: e.status || '',
     };
   }
+  // Aggregate enrichment errors so the user can see what's failing.
+  const enrichErrors = Object.values(enrichment)
+    .filter(e => e.status === 'error' || e.apollo?.status === 'org_enrich_failed' || e.apollo?.error)
+    .map(e => e.apollo?.error || e.batch?.error || 'Unknown enrichment error')
+    .filter(Boolean);
+  const enrichSuccess = Object.values(enrichment).filter(e => e.status === 'ok').length;
+  const enrichFailed = Object.values(enrichment).filter(e => e.status === 'error').length;
 
   // Aggregate + dedupe (on file_number + debtor_name) + filter by doc type.
   const allLeads = (() => {
@@ -719,6 +734,26 @@ export default function App() {
               Enriching <strong>{enrichProgress.current}</strong> of <strong>{enrichProgress.total}</strong> — current: <code>{enrichProgress.lender}</code>
             </div>
           )}
+          {(enrichSuccess > 0 || enrichFailed > 0) && (
+            <div style={{ marginTop: '0.75rem', padding: '0.6rem 0.8rem', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '6px' }}>
+              <div className="small-text">
+                <strong>Enrichment summary:</strong>{' '}
+                <span style={{ color: 'var(--good)' }}>✓ {enrichSuccess} succeeded</span>
+                {enrichFailed > 0 && <>{' · '}<span style={{ color: 'var(--error)' }}>✗ {enrichFailed} failed</span></>}
+              </div>
+              {enrichErrors.length > 0 && (
+                <details style={{ marginTop: '0.4rem' }}>
+                  <summary className="small-text" style={{ color: 'var(--error)' }}>Error details ({enrichErrors.length})</summary>
+                  <ul className="log" style={{ marginTop: '0.3rem' }}>
+                    {[...new Set(enrichErrors)].slice(0, 10).map((err, i) => <li key={i}>{err}</li>)}
+                  </ul>
+                  <p className="hint" style={{ marginTop: '0.4rem' }}>
+                    Most common cause: <code>APOLLO_API_KEY</code> not set in Netlify. Add it under Site configuration → Environment variables, then trigger a new deploy.
+                  </p>
+                </details>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -748,14 +783,23 @@ export default function App() {
                 <th>Owner</th>
                 <th>Phone</th>
                 <th>Email</th>
+                <th title="Apollo enrichment status">Enr.</th>
                 <th>Funded By</th>
               </tr>
             </thead>
             <tbody>
               {leads.slice(0, 500).map((l, i) => {
-                const e = getEnriched(l) || {};
-                const phone = e.owner_mobile || e.owner_phone_business || e.business_phone || e.owner_landline || '';
-                const email = e.owner_email || e.owner_personal_email || '';
+                const e = getEnriched(l);
+                const phone = e?.owner_mobile || e?.owner_phone_business || e?.business_phone || e?.owner_landline || '';
+                const email = e?.owner_email || e?.owner_personal_email || '';
+                let enrichBadge = <span className="muted small-text" title="Not enriched yet">–</span>;
+                if (e?.enrich_status === 'ok') {
+                  enrichBadge = <span style={{ color: 'var(--good)', fontSize: '0.78rem' }} title="Apollo found data">✓</span>;
+                } else if (e?.enrich_status === 'error') {
+                  enrichBadge = <span style={{ color: 'var(--error)', fontSize: '0.78rem' }} title={e.apollo_error || 'enrichment failed'}>✗</span>;
+                } else if (e?.apollo_status === 'no_match') {
+                  enrichBadge = <span style={{ color: 'var(--muted)', fontSize: '0.78rem' }} title="Apollo had no match for this business">∅</span>;
+                }
                 return (
                   <tr key={i}>
                     <td>
@@ -765,10 +809,11 @@ export default function App() {
                     <td>{l.document_type}</td>
                     <td>{l.date_filed}</td>
                     <td>
-                      {e.owner_name ? <><strong>{e.owner_name}</strong><div className="muted small-text">{e.owner_title}</div></> : <span className="muted">—</span>}
+                      {e?.owner_name ? <><strong>{e.owner_name}</strong><div className="muted small-text">{e.owner_title}</div></> : <span className="muted">—</span>}
                     </td>
-                    <td>{phone || <span className="muted">—</span>}{e.owner_mobile && <div className="muted small-text">📱 mobile</div>}</td>
+                    <td>{phone || <span className="muted">—</span>}{e?.owner_mobile && <div className="muted small-text">📱 mobile</div>}</td>
                     <td>{email || <span className="muted">—</span>}</td>
+                    <td>{enrichBadge}</td>
                     <td className="muted">{l.source_lender}</td>
                   </tr>
                 );

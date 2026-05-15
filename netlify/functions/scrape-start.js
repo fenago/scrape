@@ -112,7 +112,7 @@ export async function handler(event) {
 
   const payload = {
     urls: ['https://apps.gsccca.org/login.asp'],
-    formats: ['json'],
+    formats: ['html', 'markdown', 'json'],
     jsonOptions: {
       schema: LEAD_SCHEMA,
       prompt:
