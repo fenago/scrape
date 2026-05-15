@@ -136,103 +136,67 @@ export default function App() {
       setCurrentJobId(null);
       setPollCount(0);
       setLenderElapsed(0);
-      setPhase('submitting');
-      pushLog(`▶ Lender ${i + 1}/${lenders.length}: ${lender} — submitting to Firecrawl…`);
 
-      let jobId;
+      // ===== Phase 1: get variants list =====
+      setPhase('submitting variants');
+      pushLog(`▶ Lender ${i + 1}/${lenders.length}: ${lender} — getting variants list…`);
+      let variantsResult;
       try {
-        const res = await fetch('/api/scrape-start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ lender, fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch }),
+        variantsResult = await runScrapeJob({
+          mode: 'variants', lender,
+          fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch,
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        jobId = data.jobId;
-        setCurrentJobId(jobId);
-        pushLog(`  → Job ${jobId.slice(0, 8)}… submitted. Polling every ${POLL_INTERVAL_MS / 1000}s…`);
       } catch (err) {
-        const failure = { lender, status: 'error', error: `Submit: ${err.message}`, variants: [], filings: [], elapsedMs: Date.now() - lenderStartRef.current };
-        results.push(failure);
+        results.push({ lender, status: 'error', error: `Variants scrape: ${err.message}`, variants: [], filings: [], elapsedMs: Date.now() - lenderStartRef.current });
         setPerLender([...results]);
-        pushLog(`  ✗ Submit failed: ${err.message}`);
+        pushLog(`  ✗ Variants step failed: ${err.message}`);
         continue;
       }
+      const variants = (variantsResult.variants || []).filter(v => v.instrument_count > 0);
+      pushLog(`  · Found ${variants.length} variant(s) with results: ${variants.map(v => `${v.secured_party_name} (${v.instrument_count})`).join(', ') || '(none)'}`);
 
-      // Poll until Firecrawl says it's done (or user cancels). No hard timeout —
-      // we trust Firecrawl's expiresAt field as the real expiry.
-      setPhase('polling');
-      let final = null;
-      let polls = 0;
-      let lastStatus = null;
-      let scrapingRunStart = 0;
-      let lastChangeAt = Date.now();
-      let stuckWarned = false;
+      // ===== Phase 2: drill each variant =====
+      const allFilings = [];
+      let creditsUsed = variantsResult.creditsUsed || 0;
+      let perVariantStatus = [];
 
-      while (!cancelRef.current) {
-        await sleep(POLL_INTERVAL_MS);
-        polls += 1;
-        setPollCount(polls);
+      for (let v = 0; v < variants.length; v++) {
+        if (cancelRef.current) break;
+        const variant = variants[v];
+        setPhase(`drilling variant ${v + 1}/${variants.length}`);
+        pushLog(`  ↪ Drill ${v + 1}/${variants.length}: ${variant.secured_party_name} (${variant.instrument_count} expected)`);
         try {
-          const res = await fetch(`/api/scrape-poll?id=${encodeURIComponent(jobId)}`);
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-          setLastPoll(data);  // expose full poll response to UI
-
-          // Detect status change → log meaningful event.
-          if (data.status !== lastStatus) {
-            lastChangeAt = Date.now();
-            stuckWarned = false;
-            if (lastStatus === 'scraping' && data.status !== 'scraping') {
-              const dur = ((Date.now() - scrapingRunStart) / 1000).toFixed(1);
-              pushLog(`  · scraping took ${dur}s · ${data.creditsUsed || 0} credits`);
-            }
-            if (data.status === 'scraping') {
-              scrapingRunStart = Date.now();
-              pushLog(`  · Firecrawl: scraping started${data.expiresAt ? ` · expires ${new Date(data.expiresAt).toLocaleTimeString()}` : ''}`);
-            } else if (data.status === 'completed') {
-              pushLog(`  · Firecrawl: completed · ${data.creditsUsed || 0} credits · page_kind=${data.page_kind || '?'} · ${data.filings?.length || 0} filings / ${data.variants?.length || 0} variants${data.total_matched ? ` · "${data.total_matched}"` : ''}`);
-            } else if (data.status === 'failed') {
-              pushLog(`  ✗ Firecrawl: failed${data.error ? ` — ${data.error}` : ''}`);
-            } else {
-              pushLog(`  · status: ${data.status}`);
-            }
-            lastStatus = data.status;
-          } else if (data.status === 'scraping' && !stuckWarned && Date.now() - lastChangeAt > STUCK_WARN_MS) {
-            pushLog(`  ⚠ ${Math.floor(STUCK_WARN_MS / 1000)}s with no change — job may be slow or stuck. Click "Stop after current lender" to skip.`);
-            stuckWarned = true;
-          }
-
-          if (data.status === 'completed' || data.status === 'failed') { final = data; break; }
+          const drillResult = await runScrapeJob({
+            mode: 'drill', lender,
+            variantName: variant.secured_party_name,
+            fromDate, toDate, maxrows: parseInt(maxrows, 10) || 100, stemSearch,
+          });
+          creditsUsed += drillResult.creditsUsed || 0;
+          const got = (drillResult.filings || []).length;
+          allFilings.push(...(drillResult.filings || []));
+          perVariantStatus.push({ variant: variant.secured_party_name, expected: variant.instrument_count, got, status: 'ok' });
+          pushLog(`     ✓ Got ${got} filings`);
         } catch (err) {
-          pushLog(`  ✗ Poll error: ${err.message}`);
+          perVariantStatus.push({ variant: variant.secured_party_name, expected: variant.instrument_count, got: 0, status: 'error', error: err.message });
+          pushLog(`     ✗ Drill failed for "${variant.secured_party_name}": ${err.message}`);
         }
       }
 
       const elapsedMs = Date.now() - lenderStartRef.current;
-      if (final) {
-        const r = {
-          lender,
-          status: final.status === 'completed' ? 'ok' : 'error',
-          page_kind: final.page_kind,
-          total_matched: final.total_matched,
-          variants: final.variants || [],
-          filings: final.filings || [],
-          creditsUsed: final.creditsUsed,
-          finalUrl: final.finalUrl,
-          markdownSnippet: final.markdownSnippet,
-          markdownLength: final.markdownLength,
-          pageTitle: final.pageTitle,
-          firecrawlError: final.error,
-          elapsedMs,
-        };
-        results.push(r);
-        setPerLender([...results]);
-        pushLog(`  ✓ ${r.page_kind || final.status}: ${r.variants.length} variants, ${r.filings.length} filings (${(elapsedMs / 1000).toFixed(1)}s)`);
-      } else {
-        results.push({ lender, status: 'error', error: 'cancelled', variants: [], filings: [], elapsedMs });
-        setPerLender([...results]);
-      }
+      const r = {
+        lender,
+        status: 'ok',
+        page_kind: variants.length ? 'variants→filings' : 'no-variants',
+        total_matched: variants.reduce((s, v) => s + v.instrument_count, 0).toString(),
+        variants,
+        filings: allFilings,
+        perVariant: perVariantStatus,
+        creditsUsed,
+        elapsedMs,
+      };
+      results.push(r);
+      setPerLender([...results]);
+      pushLog(`  ✓ Lender done: ${variants.length} variants, ${allFilings.length} filings, ${creditsUsed} credits (${(elapsedMs / 1000).toFixed(1)}s)`);
     }
 
     setPhase('done');
@@ -242,6 +206,47 @@ export default function App() {
 
   function cancel() {
     cancelRef.current = true;
+  }
+
+  // Submit one Firecrawl job (variants OR drill mode), poll until done,
+  // return the parsed result. Throws on cancel or final failure.
+  async function runScrapeJob({ mode, lender, variantName, fromDate, toDate, maxrows, stemSearch }) {
+    const submitRes = await fetch('/api/scrape-start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, lender, variantName, fromDate, toDate, maxrows, stemSearch }),
+    });
+    const submitData = await submitRes.json();
+    if (!submitRes.ok) throw new Error(submitData.error || `submit HTTP ${submitRes.status}`);
+    const jobId = submitData.jobId;
+    setCurrentJobId(jobId);
+
+    let lastStatus = null;
+    let lastChangeAt = Date.now();
+    let stuckWarned = false;
+    while (true) {
+      if (cancelRef.current) throw new Error('cancelled');
+      await sleep(POLL_INTERVAL_MS);
+      setPollCount(c => c + 1);
+      const pollRes = await fetch(`/api/scrape-poll?id=${encodeURIComponent(jobId)}`);
+      const data = await pollRes.json();
+      if (!pollRes.ok) {
+        // Don't bail on transient errors — keep polling unless 4xx.
+        if (pollRes.status >= 400 && pollRes.status < 500) throw new Error(data.error || `poll HTTP ${pollRes.status}`);
+        continue;
+      }
+      setLastPoll(data);
+      if (data.status !== lastStatus) {
+        lastChangeAt = Date.now();
+        stuckWarned = false;
+        lastStatus = data.status;
+      } else if (data.status === 'scraping' && !stuckWarned && Date.now() - lastChangeAt > STUCK_WARN_MS) {
+        pushLog(`     ⚠ ${Math.floor(STUCK_WARN_MS / 1000)}s with no change — Firecrawl may be slow.`);
+        stuckWarned = true;
+      }
+      if (data.status === 'completed') return data;
+      if (data.status === 'failed') throw new Error(data.error || 'Firecrawl reported failed');
+    }
   }
 
   // Run enrichment for all currently-filtered leads. Chains Apollo → Batch:
@@ -684,21 +689,29 @@ export default function App() {
         </details>
       )}
 
-      {perLender.some(q => q.variants?.length > 0) && (
-        <details className="panel">
-          <summary><strong>Lender name variants seen</strong></summary>
+      {perLender.some(q => q.perVariant?.length > 0 || q.variants?.length > 0) && (
+        <details className="panel" open>
+          <summary><strong>Per-variant breakdown</strong> — every variant for every lender, with drill status</summary>
           <table className="compact">
-            <thead><tr><th>Source lender</th><th>Variant name</th><th>Instruments</th></tr></thead>
+            <thead><tr><th>Source lender</th><th>Variant name</th><th>Expected</th><th>Got</th><th>Status</th></tr></thead>
             <tbody>
-              {perLender.flatMap(q =>
-                (q.variants || []).map((v, i) => (
+              {perLender.flatMap(q => {
+                const rows = q.perVariant?.length ? q.perVariant : (q.variants || []).map(v => ({ variant: v.secured_party_name, expected: v.instrument_count, got: 0, status: '–' }));
+                return rows.map((r, i) => (
                   <tr key={`${q.lender}-${i}`}>
                     <td><code>{q.lender}</code></td>
-                    <td>{v.secured_party_name}</td>
-                    <td>{v.instrument_count}</td>
+                    <td>{r.variant}</td>
+                    <td>{r.expected}</td>
+                    <td><strong>{r.got}</strong></td>
+                    <td>
+                      {r.status === 'ok' && r.got === r.expected && <span style={{ color: 'var(--good)' }}>✓ all</span>}
+                      {r.status === 'ok' && r.got !== r.expected && <span style={{ color: '#d29922' }} title="Some rows missing">⚠ {r.got}/{r.expected}</span>}
+                      {r.status === 'error' && <span style={{ color: 'var(--error)' }} title={r.error}>✗ {r.error}</span>}
+                      {r.status === '–' && <span className="muted">—</span>}
+                    </td>
                   </tr>
-                ))
-              )}
+                ));
+              })}
             </tbody>
           </table>
         </details>

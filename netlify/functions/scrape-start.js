@@ -1,54 +1,21 @@
-// Async start endpoint: submits one lender's scrape job to Firecrawl's
-// /v1/batch/scrape (async), returns the job ID instantly. Netlify Free's
-// 10s sync timeout is no longer a concern because the heavy work happens
-// on Firecrawl's infrastructure.
+// Submit one Firecrawl batch scrape job.
 //
-// The client calls this once per selected lender (sequential, to avoid
-// concurrent GSCCCA logins), then polls /api/scrape-poll for results.
+// Two modes:
+//   mode='variants'  → login + search, stop on the variants page
+//                      (returns the list of secured-party name variants)
+//   mode='drill'     → login + search + click a SPECIFIC variant by name,
+//                      stop on the filings page (returns the actual debtors)
+//
+// Client orchestrates: scrape variants for each lender, then scrape drill
+// for each variant. This decomposition means:
+//   - Each Firecrawl job is much smaller (<60s) — no 180s wall
+//   - Every variant gets drilled (no missed leads from "drill the biggest")
+//   - One variant failing doesn't kill the whole lender
+//
+// Required Netlify env vars: FIRECRAWL_API_KEY, GSCCCA_USER, GSCCCA_PASS
 
 const FIRECRAWL_BATCH = 'https://api.firecrawl.dev/v1/batch/scrape';
 const MAX_LOOKBACK_DAYS = 365;
-
-const LEAD_SCHEMA = {
-  type: 'object',
-  properties: {
-    page_kind: {
-      type: 'string',
-      description:
-        '"filings" if rows are individual UCC filings (debtor/file/date columns); ' +
-        '"variants" if rows are secured-party NAME variants with instrument counts; ' +
-        '"none" if no items matching; "login" if bounced to login page; else "other".',
-    },
-    total_matched: { type: 'string' },
-    variants: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          secured_party_name: { type: 'string' },
-          instrument_count: { type: 'number' },
-        },
-      },
-    },
-    filings: {
-      type: 'array',
-      description:
-        'When the page shows individual UCC filings (after drilling into a variant) — ' +
-        'GA columns are FILE NUMBER, DOCUMENT TYPE, DEBTOR NAME, DATE FILED, ORIGINAL FILE NUMBER.',
-      items: {
-        type: 'object',
-        properties: {
-          file_number:          { type: 'string', description: 'Like 007-2025-024314' },
-          document_type:        { type: 'string', description: 'Original / Termination / Continuation / Amendment / etc.' },
-          debtor_name:          { type: 'string', description: 'The actual business name (the lead).' },
-          date_filed:           { type: 'string', description: 'Date filed text from the page.' },
-          original_file_number: { type: 'string', description: 'For non-Original docs, the original file # referenced.' },
-        },
-      },
-    },
-  },
-  required: ['page_kind'],
-};
 
 export async function handler(event) {
   if (event.httpMethod !== 'POST') return json(405, { error: 'Method not allowed' });
@@ -61,8 +28,11 @@ export async function handler(event) {
   let body;
   try { body = JSON.parse(event.body || '{}'); } catch { return json(400, { error: 'Invalid JSON body' }); }
 
+  const mode = body.mode === 'drill' ? 'drill' : 'variants';
   const lender = (body.lender || '').trim();
+  const variantName = (body.variantName || '').trim();
   if (!lender) return json(400, { error: 'lender is required' });
+  if (mode === 'drill' && !variantName) return json(400, { error: 'variantName is required when mode=drill' });
 
   const today = new Date();
   const earliest = new Date(today.getTime() - MAX_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
@@ -84,24 +54,25 @@ export async function handler(event) {
     "f.submit();"
   );
 
-  // GA's variants page uses: radio button per row + a "Display Details"
-  // button below the table. Verified live via Firecrawl interact session.
-  // Clicking radio + Display Details navigates to occurrences.asp with the
-  // selected variant's actual filings (debtor names, file numbers, etc.).
-  const drillJs = (
-    "(function(){" +
-      "let bestRow=null,bestCount=-1;" +
+  // Drill into the variant whose SECURED PARTY NAME column matches the
+  // requested name exactly. Falls back to largest-instrument variant if
+  // no exact name match (defensive).
+  const drillByNameJs = (
+    `(function(){` +
+      `const target=${JSON.stringify(variantName)};` +
+      "let exactRow=null,bestRow=null,bestCount=-1;" +
       "document.querySelectorAll('table tr').forEach(tr=>{" +
         "const cells=tr.querySelectorAll('td');" +
-        "if(cells.length>=3){" +
-          "const n=parseInt((cells[1].textContent||'').replace(/,/g,'').trim(),10);" +
-          "if(!isNaN(n)&&n>bestCount&&cells[0].querySelector('input[type=radio]')){" +
-            "bestCount=n;bestRow=tr;" +
-          "}" +
+        "if(cells.length>=3&&cells[0].querySelector('input[type=radio]')){" +
+          "const nameCell=cells[2]?cells[2].textContent.trim().replace(/\\s+/g,' '):'';" +
+          "const count=parseInt((cells[1].textContent||'').replace(/,/g,'').trim(),10);" +
+          "if(nameCell===target)exactRow=tr;" +
+          "if(!isNaN(count)&&count>bestCount){bestCount=count;bestRow=tr;}" +
         "}" +
       "});" +
-      "if(bestRow){" +
-        "const radio=bestRow.querySelector('input[type=radio]');" +
+      "const row=exactRow||bestRow;" +
+      "if(row){" +
+        "const radio=row.querySelector('input[type=radio]');" +
         "if(radio)radio.checked=true;" +
         "const btn=Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'))" +
           ".find(b=>((b.textContent||'')+(b.value||'')).toLowerCase().includes('display details'));" +
@@ -110,44 +81,37 @@ export async function handler(event) {
     "})();"
   );
 
+  const baseActions = [
+    { type: 'wait', milliseconds: 1000 },
+    { type: 'executeJavascript', script:
+      `document.frmLogin.txtUserID.value=${JSON.stringify(user)};` +
+      `document.frmLogin.txtPassword.value=${JSON.stringify(pass)};` +
+      "document.frmLogin.submit();"
+    },
+    { type: 'wait', milliseconds: 3000 },
+    { type: 'executeJavascript', script:
+      "window.location.href='https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty';"
+    },
+    { type: 'wait', milliseconds: 3000 },
+    { type: 'executeJavascript', script: fillSearchFormJs },
+    { type: 'wait', milliseconds: 5000 },  // wait for variants page to render
+  ];
+
+  const actions = mode === 'drill'
+    ? [
+        ...baseActions,
+        { type: 'executeJavascript', script: drillByNameJs },
+        { type: 'wait', milliseconds: 5000 },  // wait for filings page
+      ]
+    : baseActions;  // variants mode stops here
+
   const payload = {
     urls: ['https://apps.gsccca.org/login.asp'],
-    formats: ['markdown', 'json'],
-    jsonOptions: {
-      schema: LEAD_SCHEMA,
-      prompt:
-        'GSCCCA Georgia UCC results page. Determine page_kind: ' +
-        '"filings" if the table has columns FILE NUMBER, DOCUMENT TYPE, DEBTOR NAME, DATE FILED, ORIGINAL FILE NUMBER ' +
-        '(this is the drilled-into page showing individual UCC filings); ' +
-        '"variants" if columns are SELECT, INSTRUMENTS, SECURED PARTY NAME (the upper-level name-variants page); ' +
-        '"none" if body contains "no items matching"; "login" if a login form is showing; else "other". ' +
-        'For filings: extract every row\'s file_number (format like 007-YYYY-NNNNNN), document_type, debtor_name, date_filed, original_file_number. ' +
-        'For variants: extract secured_party_name + instrument_count per row. ' +
-        'Capture any "N Records Found" / "N Variations of the Name Found" text into total_matched.',
-    },
+    formats: ['markdown'],
     onlyMainContent: false,
     waitFor: 1000,
-    // Firecrawl per-scrape wall-time cap. Was 90s — for longer date ranges
-    // with hundreds of results the page render after drill can exceed that
-    // and the whole job dies silently. 180s gives plenty of headroom.
-    timeout: 180000,
-    actions: [
-      { type: 'wait', milliseconds: 1000 },
-      { type: 'executeJavascript', script:
-        `document.frmLogin.txtUserID.value=${JSON.stringify(user)};` +
-        `document.frmLogin.txtPassword.value=${JSON.stringify(pass)};` +
-        "document.frmLogin.submit();"
-      },
-      { type: 'wait', milliseconds: 3000 },
-      { type: 'executeJavascript', script:
-        "window.location.href='https://search.gsccca.org/UCC_Search/search.asp?searchtype=SecuredParty';"
-      },
-      { type: 'wait', milliseconds: 3000 },
-      { type: 'executeJavascript', script: fillSearchFormJs },
-      { type: 'wait', milliseconds: 4500 },
-      { type: 'executeJavascript', script: drillJs },
-      { type: 'wait', milliseconds: 4500 },
-    ],
+    timeout: 90000,
+    actions,
   };
 
   let res;
@@ -172,7 +136,9 @@ export async function handler(event) {
 
   return json(200, {
     jobId: data.id,
+    mode,
     lender,
+    variantName: variantName || null,
     params: { fromDate, toDate, maxrows, stemSearch },
     submittedAt: new Date().toISOString(),
   });
