@@ -514,16 +514,7 @@ export default function App() {
 
   // Count of distinct debtors still needing enrichment — drives the button
   // label and gives the user a real picture of API spend before clicking.
-  const uniqueLeadsToEnrich = (() => {
-    const seen = new Set();
-    for (const l of leads) {
-      const k = leadKey(l);
-      if (!k || seen.has(k)) continue;
-      if (enrichment[k]?.status === 'ok') continue;
-      seen.add(k);
-    }
-    return seen.size;
-  })();
+  // Must come AFTER `leads` is declared (below) — moved.
 
   // Per-lead failure detail so the user can actually see what's failing.
   // Each row: { name, fileNumber, kind: 'error'|'no_match', detail, httpStatus? }
@@ -578,6 +569,20 @@ export default function App() {
     if (!docTypeFilter.length) return true;
     return docTypeFilter.includes(l.document_type);
   });
+
+  // Count of distinct debtors still needing enrichment — must be computed
+  // after `leads` is declared above (it was previously above the declaration,
+  // which was a latent TDZ bug that started crashing once the file grew).
+  const uniqueLeadsToEnrich = (() => {
+    const seen = new Set();
+    for (const l of leads) {
+      const k = leadKey(l);
+      if (!k || seen.has(k)) continue;
+      if (enrichment[k]?.status === 'ok') continue;
+      seen.add(k);
+    }
+    return seen.size;
+  })();
 
   function rawCsv(rows) {
     // Filing columns + side-by-side per-source columns so conflicts between
