@@ -3,14 +3,17 @@
 // Apollo's /organizations/enrich endpoint REQUIRES a domain (not a name) and
 // is for enriching an org you already know the domain of. For our use case
 // (we have a debtor business NAME, not a domain), the right endpoint is
-// /mixed_people/search with q_organization_name — one call returns both the
-// org details and the matching people (owners/founders/CEOs).
+// /mixed_people/api_search with q_organization_name — one call returns both
+// the org details and the matching people (owners/founders/CEOs).
 //
-// Apollo docs: https://docs.apollo.io/reference/people-search
+// Note: Apollo deprecated /mixed_people/search for API callers in 2024 and
+// replaced it with /mixed_people/api_search. Same payload shape.
+//
+// Apollo docs: https://docs.apollo.io/reference/people-api-search
 // Auth: X-Api-Key header. Get a key at https://app.apollo.io/#/settings/integrations/api
 // Required Netlify env var: APOLLO_API_KEY
 
-const APOLLO_PEOPLE_SEARCH = 'https://api.apollo.io/api/v1/mixed_people/search';
+const APOLLO_PEOPLE_SEARCH = 'https://api.apollo.io/api/v1/mixed_people/api_search';
 
 const OWNER_TITLES = [
   'founder', 'co-founder', 'cofounder', 'owner', 'co-owner', 'president',
