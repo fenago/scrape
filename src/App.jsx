@@ -635,12 +635,8 @@ export default function App() {
               <div className="big-label">Total filings</div>
             </div>
             <div>
-              <div className="big-num">{totalVariants}</div>
-              <div className="big-label">Variants seen</div>
-            </div>
-            <div>
               <div className="big-num">{totalCredits}</div>
-              <div className="big-label">Credits used</div>
+              <div className="big-label">Firecrawl credits</div>
             </div>
           </div>
         </div>

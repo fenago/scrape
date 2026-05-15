@@ -1,12 +1,9 @@
-// Poll a Firecrawl /v1/batch/scrape job. Fast (<1s), runs entirely within
-// Netlify's 10s sync window.
+// Poll a Firecrawl /v1/batch/scrape job. Fast (<1s).
 //
-// IMPORTANT: this version parses the raw HTML table with cheerio rather than
-// relying on Firecrawl's AI JSON extraction, because the AI extraction was
-// dropping ~25% of rows when the table was long (context-limit issue). With
-// cheerio we get every row deterministically.
-
-import * as cheerio from 'cheerio';
+// Parses the Firecrawl markdown response with regex (no external deps).
+// GSCCCA renders both the filings page and the variants page as markdown
+// tables; pure-regex parsing handles every row deterministically without
+// hitting AI context limits.
 
 export async function handler(event) {
   if (event.httpMethod !== 'GET') return json(405, { error: 'Method not allowed' });
@@ -34,26 +31,30 @@ export async function handler(event) {
   }
 
   const row = Array.isArray(data.data) && data.data.length ? data.data[0] : null;
-  const html = row?.html || '';
   const markdown = row?.markdown || '';
   const aiJson = row?.json || row?.extract || {};
 
-  // === Deterministic HTML parsing (the fix) ===
-  // GA's filings page has columns: SELECT, FILE NUMBER, DOCUMENT TYPE,
-  // DEBTOR NAME, DATE FILED, ORIGINAL FILE NUMBER. The variants page has:
-  // SELECT, INSTRUMENTS, SECURED PARTY NAME. We detect which one we're on
-  // by looking at the header row.
-  const parsed = html ? parseGsccca(html) : { page_kind: null, filings: [], variants: [], total_matched: '' };
+  // Multi-tier extraction (each step wrapped in try/catch — never crashes the poll):
+  //   1. Markdown table parse (best, deterministic, gets every row)
+  //   2. AI json (fallback)
+  let parsed = { page_kind: null, filings: [], variants: [], total_matched: '' };
+  let parseError = null;
+  if (markdown) {
+    try { parsed = parseMarkdown(markdown); }
+    catch (err) { parseError = `markdown parse failed: ${err.message}`; }
+  }
 
-  // Fall back to AI JSON only if cheerio couldn't find the table.
   const filings = parsed.filings.length ? parsed.filings :
                   Array.isArray(aiJson.filings) ? aiJson.filings : [];
   const variants = parsed.variants.length ? parsed.variants :
                    Array.isArray(aiJson.variants) ? aiJson.variants : [];
   const page_kind = parsed.page_kind || aiJson.page_kind || null;
   const total_matched = parsed.total_matched || aiJson.total_matched || '';
+  const extractedBy =
+    parsed.filings.length ? 'markdown-table' :
+    (Array.isArray(aiJson.filings) && aiJson.filings.length) ? 'ai-fallback' : 'none';
 
-  // Strip useful markdown snippet (first interesting marker onward).
+  // Useful snippet of markdown (cropped to interesting section).
   const interesting = (() => {
     if (!markdown) return '';
     const markers = ['SECURED PARTY SEARCH', 'Search Results', 'Records Found', 'Variations of the Name', 'no items matching'];
@@ -79,107 +80,129 @@ export async function handler(event) {
     total_matched,
     variants,
     filings,
-    extractedBy: parsed.filings.length ? 'cheerio' : (Array.isArray(aiJson.filings) && aiJson.filings.length ? 'ai-fallback' : 'none'),
+    extractedBy,
+    parseError,
     finalUrl: row?.metadata?.sourceURL || row?.metadata?.url || null,
     markdownSnippet: interesting,
     markdownLength: markdown.length,
-    htmlLength: html.length,
     pageTitle: row?.metadata?.title || null,
     error: firecrawlError,
     polledAt: new Date().toISOString(),
   });
 }
 
-// Parse the GSCCCA results page deterministically. Walks every <table>, looks
-// for header rows that match either the filings layout or the variants layout,
-// then extracts every row. Returns ALL rows — no AI context limits.
-function parseGsccca(html) {
-  const $ = cheerio.load(html);
+// --- Markdown table parser (no external deps) ---
+// GA renders results as markdown tables of the form:
+//   | header1 | header2 | header3 |
+//   | --- | --- | --- |
+//   | val1   | val2   | val3   |
+// We find every table, classify it by its header, and extract every row.
+function parseMarkdown(md) {
   const out = { page_kind: null, filings: [], variants: [], total_matched: '' };
 
-  // Detect "no items matching" / "no records found" up front.
-  const bodyText = $.root().text().replace(/\s+/g, ' ');
-  if (/no\s+items?\s+matching\s+your\s+search/i.test(bodyText) ||
-      /no\s+(?:records?|results?)\s+(?:were\s+)?found/i.test(bodyText)) {
+  // Detect "no items matching" and login-bounce up front.
+  const flat = md.replace(/\s+/g, ' ');
+  if (/no\s+items?\s+matching\s+your\s+search/i.test(flat) ||
+      /no\s+(?:records?|results?)\s+(?:were\s+)?found/i.test(flat)) {
     out.page_kind = 'none';
     out.total_matched = '0';
     return out;
   }
-  if ($('input[name="txtUserID"]').length || /please.{0,40}login\s+name\s+and\s+password/i.test(bodyText)) {
-    out.page_kind = 'login';
-    return out;
+  if (/please.{0,40}login\s+name\s+and\s+password/i.test(flat) || /login.asp/i.test(md)) {
+    // Only a strong signal if the whole page is the login form, not just a link.
+    if (!/Records Found|Variations of the Name|SECURED PARTY SEARCH/i.test(md)) {
+      out.page_kind = 'login';
+    }
   }
 
-  // Find the largest table whose header row contains either FILE NUMBER (filings)
-  // or SECURED PARTY NAME (variants). Try every table — GA wraps in layout tables.
   const fileNumRe = /^\d{3}-\d{4}-\d{6}$/;
+  const lines = md.split('\n');
 
-  $('table').each((_, tbl) => {
-    const $tbl = $(tbl);
-    const rows = $tbl.find('tr');
-    if (rows.length < 2) return;
+  // Walk lines, find table header rows (lines with | and including key columns),
+  // then collect subsequent table rows until the table ends.
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.includes('|')) continue;
 
-    const headerCells = rows.first().find('th, td').map((i, c) => $(c).text().trim().toLowerCase().replace(/\s+/g, ' ')).get();
-    const headerJoined = headerCells.join(' | ');
+    const headers = splitMdRow(line).map(c => c.trim().toLowerCase().replace(/\*/g, ''));
+    if (headers.length < 3) continue;
+    const headerJoined = headers.join(' | ');
 
-    // FILINGS layout
-    if (/file number/.test(headerJoined) && /debtor/.test(headerJoined)) {
-      const idx = {
-        file_number:          headerCells.findIndex(h => /file number/.test(h)),
-        document_type:        headerCells.findIndex(h => /document type|type/.test(h)),
-        debtor_name:          headerCells.findIndex(h => /debtor/.test(h)),
-        date_filed:           headerCells.findIndex(h => /date filed|filed/.test(h)),
-        original_file_number: headerCells.findIndex(h => /original/.test(h)),
-      };
-      rows.slice(1).each((_, tr) => {
-        const cells = $(tr).find('td').map((i, c) => $(c).text().trim().replace(/\s+/g, ' ')).get();
-        if (cells.length < 3) return;
-        const fn = pickCell(cells, idx.file_number);
-        if (!fileNumRe.test(fn)) return;
+    // Skip the divider row that follows.
+    const isFilings = /file number/.test(headerJoined) && /debtor/.test(headerJoined);
+    const isVariants = /secured party name/.test(headerJoined) && /instrument/.test(headerJoined);
+    if (!isFilings && !isVariants) continue;
+
+    // Locate column indices we care about.
+    const idx = isFilings ? {
+      file_number:          headers.findIndex(h => /file number/.test(h)),
+      document_type:        headers.findIndex(h => /document type|^type$/.test(h)),
+      debtor_name:          headers.findIndex(h => /debtor/.test(h)),
+      date_filed:           headers.findIndex(h => /date filed|^filed$/.test(h)),
+      original_file_number: headers.findIndex(h => /original/.test(h)),
+    } : {
+      instruments:        headers.findIndex(h => /instrument/.test(h)),
+      secured_party_name: headers.findIndex(h => /secured party name/.test(h)),
+    };
+
+    // Iterate subsequent lines as table rows until we hit a non-table line.
+    for (let j = i + 1; j < lines.length; j++) {
+      const rowLine = lines[j];
+      if (!rowLine.includes('|')) break;
+      const cells = splitMdRow(rowLine).map(c => c.trim());
+      // Skip divider rows like | --- | --- |
+      if (cells.every(c => /^[-:\s]*$/.test(c))) continue;
+      if (cells.length < headers.length - 1) continue; // tolerate ragged rows
+
+      if (isFilings) {
+        const fn = cells[idx.file_number] || '';
+        if (!fileNumRe.test(fn)) continue;
         out.filings.push({
           file_number:          fn,
-          document_type:        pickCell(cells, idx.document_type),
-          debtor_name:          pickCell(cells, idx.debtor_name),
-          date_filed:           pickCell(cells, idx.date_filed),
-          original_file_number: pickCell(cells, idx.original_file_number),
+          document_type:        cells[idx.document_type] || '',
+          debtor_name:          cells[idx.debtor_name] || '',
+          date_filed:           cells[idx.date_filed] || '',
+          original_file_number: cells[idx.original_file_number] || '',
         });
-      });
-      out.page_kind = 'filings';
-    }
-
-    // VARIANTS layout
-    if (!out.page_kind && /secured party name/.test(headerJoined) && /instrument/.test(headerJoined)) {
-      const idx = {
-        instruments:        headerCells.findIndex(h => /instrument/.test(h)),
-        secured_party_name: headerCells.findIndex(h => /secured party name/.test(h)),
-      };
-      rows.slice(1).each((_, tr) => {
-        const cells = $(tr).find('td').map((i, c) => $(c).text().trim().replace(/\s+/g, ' ')).get();
-        if (cells.length < 2) return;
-        const count = parseInt(pickCell(cells, idx.instruments).replace(/,/g, ''), 10);
-        const name = pickCell(cells, idx.secured_party_name);
-        if (!isNaN(count) && name) {
+        out.page_kind = 'filings';
+      } else if (isVariants) {
+        const count = parseInt((cells[idx.instruments] || '').replace(/,/g, ''), 10);
+        const name = cells[idx.secured_party_name] || '';
+        if (!isNaN(count) && name && !/^secured party name$/i.test(name)) {
           out.variants.push({ secured_party_name: name, instrument_count: count });
+          out.page_kind = 'variants';
         }
-      });
-      out.page_kind = 'variants';
+      }
     }
-  });
+    // Once we've found a real results table, stop scanning.
+    if (out.filings.length || out.variants.length) break;
+  }
 
-  // Extract "N Records Found" / "N Variations of the Name Found" total.
+  // Extract "N Records Found" / "N Variations" total for display.
   const m =
-    bodyText.match(/(\d+(?:,\d{3})*)\s+records?\s+found/i) ||
-    bodyText.match(/(\d+(?:,\d{3})*)\s+variations?\s+of\s+the\s+name\s+found/i) ||
-    bodyText.match(/(\d+(?:,\d{3})*)\s+items?\s+matched/i);
+    flat.match(/(\d+(?:,\d{3})*)\s+records?\s+found/i) ||
+    flat.match(/(\d+(?:,\d{3})*)\s+variations?\s+of\s+the\s+name\s+found/i) ||
+    flat.match(/(\d+(?:,\d{3})*)\s+items?\s+matched/i);
   if (m) out.total_matched = m[1];
 
   if (!out.page_kind) out.page_kind = 'other';
   return out;
 }
 
-function pickCell(cells, i) {
-  if (i < 0 || i >= cells.length) return '';
-  return cells[i] || '';
+function splitMdRow(line) {
+  // Splits a markdown table row into cells. Handles leading/trailing pipes
+  // and escaped pipes (\|) in cell content.
+  const trimmed = line.replace(/^\s*\|/, '').replace(/\|\s*$/, '');
+  const parts = [];
+  let buf = '';
+  for (let i = 0; i < trimmed.length; i++) {
+    const c = trimmed[i];
+    if (c === '\\' && trimmed[i + 1] === '|') { buf += '|'; i++; continue; }
+    if (c === '|') { parts.push(buf); buf = ''; continue; }
+    buf += c;
+  }
+  parts.push(buf);
+  return parts;
 }
 
 function json(statusCode, body) {

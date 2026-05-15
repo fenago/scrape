@@ -1,19 +1,22 @@
-// Apollo.io enrichment: business name + state → business contact + owner identification.
+// Apollo.io enrichment via Mixed People Search.
 //
-// Two-step flow:
-//   1. POST /api/v1/organizations/enrich       — find the org, get primary phone / website / industry
-//   2. POST /api/v1/mixed_people/search        — find owner/founder/CEO at that org
+// Apollo's /organizations/enrich endpoint REQUIRES a domain (not a name) and
+// is for enriching an org you already know the domain of. For our use case
+// (we have a debtor business NAME, not a domain), the right endpoint is
+// /mixed_people/search with q_organization_name — one call returns both the
+// org details and the matching people (owners/founders/CEOs).
 //
-// Apollo auth: X-Api-Key header. Get a key at https://app.apollo.io/#/settings/integrations/api
+// Apollo docs: https://docs.apollo.io/reference/people-search
+// Auth: X-Api-Key header. Get a key at https://app.apollo.io/#/settings/integrations/api
 // Required Netlify env var: APOLLO_API_KEY
 
-const APOLLO_ORG_ENRICH = 'https://api.apollo.io/api/v1/organizations/enrich';
 const APOLLO_PEOPLE_SEARCH = 'https://api.apollo.io/api/v1/mixed_people/search';
 
 const OWNER_TITLES = [
   'founder', 'co-founder', 'cofounder', 'owner', 'co-owner', 'president',
-  'ceo', 'chief executive', 'managing partner', 'managing director',
-  'principal', 'proprietor',
+  'ceo', 'chief executive', 'chief executive officer',
+  'managing partner', 'managing director', 'managing member',
+  'principal', 'proprietor', 'general manager',
 ];
 
 export async function handler(event) {
@@ -25,81 +28,79 @@ export async function handler(event) {
   try { body = JSON.parse(event.body || '{}'); } catch { return json(400, { error: 'Invalid JSON body' }); }
 
   const businessName = (body.businessName || '').trim();
-  const state = (body.state || 'GA').trim();
   if (!businessName) return json(400, { error: 'businessName is required' });
 
-  // Step 1: org enrich.
-  let org;
+  // Strip common LLC/INC/CORP suffixes — Apollo's name match works better
+  // against the bare brand than against the legal entity form.
+  const searchName = businessName
+    .replace(/[,.]/g, '')
+    .replace(/\s+(LLC|INC\.?|CORP\.?|CORPORATION|L\.L\.C\.?|L\.P\.?|LP|LLP|CO\.?)$/i, '')
+    .trim();
+
+  let res;
   try {
-    const res = await fetch(APOLLO_ORG_ENRICH, {
+    res = await fetch(APOLLO_PEOPLE_SEARCH, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'no-cache',
         'X-Api-Key': apiKey,
       },
-      body: JSON.stringify({ name: businessName }),
+      body: JSON.stringify({
+        q_organization_name: searchName,
+        person_titles: OWNER_TITLES,
+        page: 1,
+        per_page: 10,
+      }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      return json(200, {
-        status: 'org_enrich_failed',
-        error: data.error || data.message || `Apollo HTTP ${res.status}`,
-      });
-    }
-    org = data.organization || null;
   } catch (err) {
-    return json(502, { status: 'error', error: `Apollo org request failed: ${err.message}` });
+    return json(502, { status: 'error', error: `Apollo request failed: ${err.message}` });
   }
 
-  if (!org) {
-    return json(200, { status: 'no_match', message: 'Apollo found no organization match.' });
+  const raw = await res.text();
+  let data;
+  try { data = JSON.parse(raw); } catch {
+    return json(502, { status: 'error', error: 'Apollo returned non-JSON', body: raw.slice(0, 300) });
   }
 
-  // Step 2: search for owner/founder at this org.
-  let owner = null;
-  let peopleAttempted = false;
-  if (org.id || org.organization_id) {
-    peopleAttempted = true;
-    try {
-      const res = await fetch(APOLLO_PEOPLE_SEARCH, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Cache-Control': 'no-cache',
-          'X-Api-Key': apiKey,
-        },
-        body: JSON.stringify({
-          organization_ids: [org.id || org.organization_id],
-          person_titles: OWNER_TITLES,
-          page: 1,
-          per_page: 5,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        const people = data.people || data.contacts || [];
-        if (people.length) {
-          // Prefer a founder/owner over CEO if both present.
-          const score = p => {
-            const t = (p.title || '').toLowerCase();
-            if (/founder|owner|proprietor/.test(t)) return 3;
-            if (/president|principal/.test(t)) return 2;
-            if (/ceo|chief executive|managing/.test(t)) return 1;
-            return 0;
-          };
-          people.sort((a, b) => score(b) - score(a));
-          owner = people[0];
-        }
-      }
-    } catch { /* non-fatal */ }
+  if (!res.ok) {
+    return json(200, {
+      status: 'apollo_error',
+      httpStatus: res.status,
+      error: data.error || data.message || data.errors || `Apollo HTTP ${res.status}`,
+      raw: data,
+    });
   }
+
+  const people = data.people || data.contacts || [];
+  if (!people.length) {
+    return json(200, {
+      status: 'no_match',
+      message: `Apollo found no matching people at organizations named "${searchName}".`,
+      pagination: data.pagination || null,
+    });
+  }
+
+  // Score and pick the best-fit owner. Founder/owner > president/principal > CEO.
+  const score = p => {
+    const t = (p.title || '').toLowerCase();
+    if (/founder|co-?founder/.test(t)) return 5;
+    if (/owner|proprietor/.test(t)) return 4;
+    if (/president/.test(t)) return 3;
+    if (/managing\s+(partner|director|member)/.test(t)) return 3;
+    if (/principal/.test(t)) return 2;
+    if (/ceo|chief\s+executive/.test(t)) return 2;
+    return 1;
+  };
+  const sorted = [...people].sort((a, b) => score(b) - score(a));
+  const owner = sorted[0];
+  const org = owner.organization || {};
 
   return json(200, {
     status: 'ok',
     business: {
       name: org.name || businessName,
-      phone: org.primary_phone?.number || org.phone || '',
+      phone: org.primary_phone?.number || org.phone || org.sanitized_phone || '',
       website: org.website_url || org.primary_domain || '',
       industry: org.industry || '',
       employees: org.estimated_num_employees || null,
@@ -108,19 +109,22 @@ export async function handler(event) {
       linkedin_url: org.linkedin_url || '',
       founded_year: org.founded_year || null,
     },
-    owner: owner ? {
+    owner: {
       first_name: owner.first_name || '',
       last_name: owner.last_name || '',
       full_name: owner.name || `${owner.first_name || ''} ${owner.last_name || ''}`.trim(),
       title: owner.title || '',
       email: owner.email || '',
-      phone: owner.phone_numbers?.[0]?.sanitized_number || owner.phone_numbers?.[0]?.raw_number || '',
+      phone:
+        owner.phone_numbers?.[0]?.sanitized_number ||
+        owner.phone_numbers?.[0]?.raw_number ||
+        owner.phone || '',
       linkedin_url: owner.linkedin_url || '',
       city: owner.city || '',
       state: owner.state || '',
-    } : null,
-    peopleAttempted,
-    creditsHint: peopleAttempted ? '~2 credits' : '~1 credit',
+    },
+    matchCount: people.length,
+    searchedName: searchName,
   });
 }
 

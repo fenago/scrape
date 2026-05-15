@@ -112,7 +112,7 @@ export async function handler(event) {
 
   const payload = {
     urls: ['https://apps.gsccca.org/login.asp'],
-    formats: ['html', 'markdown', 'json'],
+    formats: ['markdown', 'json'],
     jsonOptions: {
       schema: LEAD_SCHEMA,
       prompt:
@@ -127,7 +127,10 @@ export async function handler(event) {
     },
     onlyMainContent: false,
     waitFor: 1000,
-    timeout: 90000,
+    // Firecrawl per-scrape wall-time cap. Was 90s — for longer date ranges
+    // with hundreds of results the page render after drill can exceed that
+    // and the whole job dies silently. 180s gives plenty of headroom.
+    timeout: 180000,
     actions: [
       { type: 'wait', milliseconds: 1000 },
       { type: 'executeJavascript', script:
