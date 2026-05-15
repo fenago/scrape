@@ -60,6 +60,13 @@ export default function App() {
   const [customTags, setCustomTags] = useState('');
   const [notesPrefix, setNotesPrefix] = useState('');
 
+  // Enrichment state: file_number → { apollo: {...}, batch: {...}, status }
+  const [enrichment, setEnrichment] = useState({});
+  const [enriching, setEnriching] = useState(false);
+  const [enrichProgress, setEnrichProgress] = useState(null);
+  const [enrichSources, setEnrichSources] = useState({ apollo: true, batch: true });
+  const enrichCancelRef = useRef(false);
+
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState('idle');    // 'idle' | 'submitting' | 'polling' | 'parsing' | 'done'
   const [currentIdx, setCurrentIdx] = useState(0);
@@ -233,6 +240,92 @@ export default function App() {
     cancelRef.current = true;
   }
 
+  // Run enrichment for all currently-filtered leads. Chains Apollo → Batch:
+  // Apollo identifies the owner from the business name; Batch then skip-traces
+  // that owner's personal cell + email. Either step is optional via toggles.
+  async function enrichAll() {
+    setError(null);
+    setEnriching(true);
+    enrichCancelRef.current = false;
+    const targets = leads;
+    const acc = { ...enrichment };
+    for (let i = 0; i < targets.length; i++) {
+      if (enrichCancelRef.current) break;
+      const l = targets[i];
+      const key = l.file_number + '|' + l.debtor_name;
+      setEnrichProgress({ current: i + 1, total: targets.length, lender: l.debtor_name });
+      if (acc[key]?.status === 'ok') continue; // already enriched
+
+      const entry = acc[key] || {};
+      // Apollo step
+      if (enrichSources.apollo) {
+        try {
+          const res = await fetch('/api/enrich-apollo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ businessName: l.debtor_name, state: 'GA' }),
+          });
+          const data = await res.json();
+          entry.apollo = data;
+        } catch (err) {
+          entry.apollo = { status: 'error', error: err.message };
+        }
+      }
+      // Batch step — needs owner name from Apollo (or skip if not available)
+      if (enrichSources.batch) {
+        const owner = entry.apollo?.owner;
+        if (owner?.first_name || owner?.last_name) {
+          try {
+            const res = await fetch('/api/enrich-batch', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                firstName: owner.first_name,
+                lastName: owner.last_name,
+                state: 'GA',
+                city: owner.city || entry.apollo?.business?.city,
+              }),
+            });
+            const data = await res.json();
+            entry.batch = data;
+          } catch (err) {
+            entry.batch = { status: 'error', error: err.message };
+          }
+        } else {
+          entry.batch = { status: 'skipped', reason: 'No owner identified by Apollo — Batch needs a first/last name' };
+        }
+      }
+      entry.status = 'ok';
+      acc[key] = entry;
+      setEnrichment({ ...acc });
+    }
+    setEnrichProgress(null);
+    setEnriching(false);
+  }
+
+  function cancelEnrich() { enrichCancelRef.current = true; }
+
+  function leadKey(l) { return l.file_number + '|' + l.debtor_name; }
+  function getEnriched(l) {
+    const e = enrichment[leadKey(l)];
+    if (!e) return null;
+    return {
+      business_phone: e.apollo?.business?.phone || '',
+      business_website: e.apollo?.business?.website || '',
+      industry: e.apollo?.business?.industry || '',
+      owner_name: e.apollo?.owner?.full_name || '',
+      owner_title: e.apollo?.owner?.title || '',
+      owner_email: e.apollo?.owner?.email || '',
+      owner_phone_business: e.apollo?.owner?.phone || '',
+      owner_mobile: e.batch?.person?.mobile || '',
+      owner_landline: e.batch?.person?.landline || '',
+      owner_personal_email: e.batch?.person?.email || '',
+      owner_address: e.batch?.person?.current_address || '',
+      apollo_status: e.apollo?.status || '',
+      batch_status: e.batch?.status || '',
+    };
+  }
+
   // Aggregate + dedupe (on file_number + debtor_name) + filter by doc type.
   const allLeads = (() => {
     const seen = new Set();
@@ -253,17 +346,33 @@ export default function App() {
   });
 
   function rawCsv(rows) {
-    const headers = ['file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender'];
-    return [headers.join(','), ...rows.map(l => headers.map(h => csvCell(l[h])).join(','))].join('\n');
+    const headers = [
+      'file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender',
+      'business_phone', 'business_website', 'industry',
+      'owner_name', 'owner_title', 'owner_email', 'owner_phone_business',
+      'owner_mobile', 'owner_landline', 'owner_personal_email', 'owner_address',
+    ];
+    return [headers.join(','), ...rows.map(l => {
+      const e = getEnriched(l) || {};
+      return headers.map(h => csvCell(l[h] !== undefined ? l[h] : e[h])).join(',');
+    })].join('\n');
   }
   function ghlCsv(rows) {
     const headers = ['First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address', 'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes'];
     const userTags = customTags.split(',').map(t => t.trim()).filter(Boolean);
     return [headers.join(','), ...rows.map(l => {
+      const e = getEnriched(l) || {};
+      const [firstName, ...rest] = (e.owner_name || '').split(' ');
+      const lastName = rest.join(' ');
+      const email = e.owner_email || e.owner_personal_email || '';
+      const phone = e.owner_mobile || e.owner_phone_business || e.business_phone || e.owner_landline || '';
       const autoTags = [
         'ucc-ga-lead',
         l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`,
         l.document_type && `doc-${l.document_type.toLowerCase()}`,
+        e.industry && `industry-${e.industry.toLowerCase().replace(/\s+/g, '-')}`,
+        e.owner_mobile && 'has-cell',
+        email && 'has-email',
       ].filter(Boolean);
       const tags = [...autoTags, ...userTags].join('; ');
       const noteParts = [
@@ -272,9 +381,12 @@ export default function App() {
         l.date_filed && `Filed: ${l.date_filed}`,
         l.document_type && `Type: ${l.document_type}`,
         l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`,
+        e.business_website && `Site: ${e.business_website}`,
+        e.owner_title && `Owner title: ${e.owner_title}`,
+        e.owner_landline && `Landline: ${e.owner_landline}`,
       ].filter(Boolean);
       const notes = noteParts.join(' | ');
-      return ['', '', '', '', l.debtor_name, '', '', 'GA', '', 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
+      return [firstName || '', lastName, email, phone, l.debtor_name, e.owner_address || '', '', 'GA', '', 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
     })].join('\n');
   }
   function jsonExport(rows) { return JSON.stringify(rows, null, 2); }
@@ -579,6 +691,41 @@ export default function App() {
 
       {leads.length > 0 && (
         <div className="panel">
+          <div className="csv-tabs" style={{ marginBottom: '0.5rem' }}>
+            <strong>🔎 Skip tracing / enrichment</strong>
+            <div className="chips">
+              <button type="button" className={`chip ${enrichSources.apollo ? 'on' : ''}`} onClick={() => setEnrichSources(s => ({ ...s, apollo: !s.apollo }))}>
+                Apollo.io {enrichSources.apollo ? '✓' : ''}
+              </button>
+              <button type="button" className={`chip ${enrichSources.batch ? 'on' : ''}`} onClick={() => setEnrichSources(s => ({ ...s, batch: !s.batch }))}>
+                BatchData (skip trace) {enrichSources.batch ? '✓' : ''}
+              </button>
+            </div>
+          </div>
+          <p className="hint" style={{ marginBottom: '0.75rem' }}>
+            <strong>Apollo</strong> finds the business + owner name + business email. <strong>BatchData</strong> skip-traces the owner's personal cell + email + home address (needs Apollo first to identify the owner, OR works alone if the debtor field already contains a person's name).
+            Each enrichment costs ~$0.05–$0.30 per lead.
+          </p>
+          <div className="submit-row" style={{ paddingTop: 0, borderTop: 'none' }}>
+            {!enriching ? (
+              <button type="button" onClick={enrichAll} disabled={!enrichSources.apollo && !enrichSources.batch}>
+                Enrich {leads.filter(l => enrichment[leadKey(l)]?.status !== 'ok').length} lead{leads.length === 1 ? '' : 's'}
+              </button>
+            ) : (
+              <button type="button" onClick={cancelEnrich}>Stop enrichment</button>
+            )}
+            <button type="button" className="link" onClick={() => setEnrichment({})}>Clear enrichment cache</button>
+          </div>
+          {enrichProgress && (
+            <div className="muted small-text" style={{ marginTop: '0.5rem' }}>
+              Enriching <strong>{enrichProgress.current}</strong> of <strong>{enrichProgress.total}</strong> — current: <code>{enrichProgress.lender}</code>
+            </div>
+          )}
+        </div>
+      )}
+
+      {leads.length > 0 && (
+        <div className="panel">
           <div className="csv-tabs">
             <strong>Export preview</strong>
             <div className="chips">
@@ -596,19 +743,38 @@ export default function App() {
           <h3>Leads ({leads.length})</h3>
           <table>
             <thead>
-              <tr><th>Debtor (Lead)</th><th>File #</th><th>Doc Type</th><th>Date Filed</th><th>Original File #</th><th>Funded By</th></tr>
+              <tr>
+                <th>Debtor (Lead)</th>
+                <th>Doc Type</th>
+                <th>Date Filed</th>
+                <th>Owner</th>
+                <th>Phone</th>
+                <th>Email</th>
+                <th>Funded By</th>
+              </tr>
             </thead>
             <tbody>
-              {leads.slice(0, 500).map((l, i) => (
-                <tr key={i}>
-                  <td><strong>{l.debtor_name}</strong></td>
-                  <td><code>{l.file_number}</code></td>
-                  <td>{l.document_type}</td>
-                  <td>{l.date_filed}</td>
-                  <td className="muted">{l.original_file_number}</td>
-                  <td className="muted">{l.source_lender}</td>
-                </tr>
-              ))}
+              {leads.slice(0, 500).map((l, i) => {
+                const e = getEnriched(l) || {};
+                const phone = e.owner_mobile || e.owner_phone_business || e.business_phone || e.owner_landline || '';
+                const email = e.owner_email || e.owner_personal_email || '';
+                return (
+                  <tr key={i}>
+                    <td>
+                      <strong>{l.debtor_name}</strong>
+                      <div className="muted small-text"><code>{l.file_number}</code></div>
+                    </td>
+                    <td>{l.document_type}</td>
+                    <td>{l.date_filed}</td>
+                    <td>
+                      {e.owner_name ? <><strong>{e.owner_name}</strong><div className="muted small-text">{e.owner_title}</div></> : <span className="muted">—</span>}
+                    </td>
+                    <td>{phone || <span className="muted">—</span>}{e.owner_mobile && <div className="muted small-text">📱 mobile</div>}</td>
+                    <td>{email || <span className="muted">—</span>}</td>
+                    <td className="muted">{l.source_lender}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </>

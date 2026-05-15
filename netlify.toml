@@ -19,6 +19,16 @@
   status = 200
 
 [[redirects]]
+  from = "/api/enrich-apollo"
+  to = "/.netlify/functions/enrich-apollo"
+  status = 200
+
+[[redirects]]
+  from = "/api/enrich-batch"
+  to = "/.netlify/functions/enrich-batch"
+  status = 200
+
+[[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
