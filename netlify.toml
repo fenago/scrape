@@ -24,6 +24,11 @@
   status = 200
 
 [[redirects]]
+  from = "/api/enrich-gasos"
+  to = "/.netlify/functions/enrich-gasos"
+  status = 200
+
+[[redirects]]
   from = "/api/enrich-batch"
   to = "/.netlify/functions/enrich-batch"
   status = 200

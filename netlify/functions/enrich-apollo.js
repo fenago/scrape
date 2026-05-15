@@ -33,6 +33,11 @@ export async function handler(event) {
   const businessName = (body.businessName || '').trim();
   if (!businessName) return json(400, { error: 'businessName is required' });
 
+  // Reveal flags. Defaults: reveal email (cheap, ~1 credit), do NOT reveal
+  // phone (expensive, ~8 credits per result). Caller can opt-in to phone.
+  const revealEmail = body.revealEmail !== false;
+  const revealPhone = body.revealPhone === true;
+
   // Strip common LLC/INC/CORP suffixes — Apollo's name match works better
   // against the bare brand than against the legal entity form.
   const searchName = businessName
@@ -41,7 +46,7 @@ export async function handler(event) {
     .trim();
 
   const t0 = Date.now();
-  console.log(`[apollo] search businessName="${businessName}" searchName="${searchName}"`);
+  console.log(`[apollo] search businessName="${businessName}" searchName="${searchName}" revealEmail=${revealEmail} revealPhone=${revealPhone}`);
 
   let res;
   try {
@@ -57,6 +62,8 @@ export async function handler(event) {
         person_titles: OWNER_TITLES,
         page: 1,
         per_page: 10,
+        reveal_personal_emails: revealEmail,
+        reveal_phone_number: revealPhone,
       }),
     });
   } catch (err) {
@@ -128,15 +135,22 @@ export async function handler(event) {
       last_name: owner.last_name || '',
       full_name: owner.name || `${owner.first_name || ''} ${owner.last_name || ''}`.trim(),
       title: owner.title || '',
-      email: owner.email || '',
+      // When reveal_personal_emails=true, Apollo returns unlocked addresses
+      // in `personal_emails`. The plain `email` field is often a locked
+      // placeholder like `email_not_unlocked@domain.com` — filter that out.
+      email: pickEmail(owner),
+      personal_emails: Array.isArray(owner.personal_emails) ? owner.personal_emails : [],
+      // Phone fields only populate when reveal_phone_number=true.
       phone:
         owner.phone_numbers?.[0]?.sanitized_number ||
         owner.phone_numbers?.[0]?.raw_number ||
         owner.phone || '',
+      mobile_phone: owner.mobile_phone || '',
       linkedin_url: owner.linkedin_url || '',
       city: owner.city || '',
       state: owner.state || '',
     },
+    revealed: { email: revealEmail, phone: revealPhone },
     matchCount: people.length,
     searchedName: searchName,
   });
@@ -144,6 +158,17 @@ export async function handler(event) {
 
 function json(statusCode, body) {
   return { statusCode, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+}
+
+// Pick the best email from an Apollo person record. `personal_emails` (when
+// reveal_personal_emails=true) is most reliable; `email` is often a locked
+// placeholder `email_not_unlocked@domain.com` we want to skip.
+function pickEmail(p) {
+  const personal = Array.isArray(p.personal_emails) ? p.personal_emails.filter(Boolean) : [];
+  if (personal.length) return personal[0];
+  const e = p.email || '';
+  if (!e || /email_not_unlocked|domain\.com$|locked/i.test(e)) return '';
+  return e;
 }
 
 // Apollo's error shape varies: { error: "..." }, { message: "..." },

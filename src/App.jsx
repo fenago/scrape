@@ -62,13 +62,18 @@ export default function App() {
   const [customTags, setCustomTags] = useState('');
   const [notesPrefix, setNotesPrefix] = useState('');
 
-  // Enrichment state: file_number → { apollo: {...}, batch: {...}, status }
+  // Enrichment state: file_number → { gasos: {...}, apollo: {...}, batch: {...}, status }
   const [enrichment, setEnrichment] = useState({});
   const [enriching, setEnriching] = useState(false);
   const [enrichProgress, setEnrichProgress] = useState(null);
-  // BatchData disabled by default per user preference (too expensive).
-  // The /api/enrich-batch function still exists; flip batch:true here to re-enable.
-  const [enrichSources, setEnrichSources] = useState({ apollo: true, batch: false });
+  // GA SoS + Apollo both on by default — they're complementary. SoS catches
+  // small LLCs Apollo doesn't index; Apollo catches established businesses
+  // with LinkedIn/web footprints. BatchData chains off either to get the
+  // owner's personal cell + email.
+  const [enrichSources, setEnrichSources] = useState({ gasos: true, apollo: true, batch: true });
+  // Apollo reveal flags. Email is cheap (~1 credit), phone is expensive
+  // (~8 credits) — phone is opt-in.
+  const [apolloReveal, setApolloReveal] = useState({ email: true, phone: false });
   const enrichCancelRef = useRef(false);
 
   const [running, setRunning] = useState(false);
@@ -160,8 +165,13 @@ export default function App() {
       let creditsUsed = variantsResult.creditsUsed || 0;
       let perVariantStatus = [];
 
+      // Intentionally NO cancel check inside the variant loop. The button is
+      // labeled "Stop after current lender" — meaning we finish ALL variants
+      // for the lender currently in flight, then stop before starting the
+      // next lender (the cancel check at the top of the outer loop handles
+      // that). Breaking mid-variant would discard partial filings and the
+      // user would see "nothing returned".
       for (let v = 0; v < variants.length; v++) {
-        if (cancelRef.current) break;
         const variant = variants[v];
         setPhase(`drilling variant ${v + 1}/${variants.length}`);
         pushLog(`  ↪ Drill ${v + 1}/${variants.length}: ${variant.secured_party_name} (${variant.instrument_count} expected)`);
@@ -224,8 +234,11 @@ export default function App() {
     let lastStatus = null;
     let lastChangeAt = Date.now();
     let stuckWarned = false;
+    // Note: we do NOT abort the poll on cancelRef. "Stop after current lender"
+    // means finish the in-flight scrape and let its results land; the outer
+    // loop is what actually stops the sweep. Aborting mid-poll would discard
+    // partial work and leave the user with empty results.
     while (true) {
-      if (cancelRef.current) throw new Error('cancelled');
       await sleep(POLL_INTERVAL_MS);
       setPollCount(c => c + 1);
       const pollRes = await fetch(`/api/scrape-poll?id=${encodeURIComponent(jobId)}`);
@@ -249,9 +262,9 @@ export default function App() {
     }
   }
 
-  // Run enrichment for all currently-filtered leads. Chains Apollo → Batch:
-  // Apollo identifies the owner from the business name; Batch then skip-traces
-  // that owner's personal cell + email. Either step is optional via toggles.
+  // Run enrichment for all currently-filtered leads. Chains:
+  //   GA SoS (free, ~95% SMB coverage) → Apollo (medium-biz coverage)
+  //   → BatchData skip-trace (needs a first/last name from either source)
   async function enrichAll() {
     setError(null);
     setEnriching(true);
@@ -266,54 +279,87 @@ export default function App() {
       if (acc[key]?.status === 'ok') continue; // already enriched
 
       const entry = acc[key] || {};
+      // GA Secretary of State step — public records, free, best coverage for
+      // small/sole-prop LLCs. Returns registered agent (often the owner).
+      if (enrichSources.gasos) {
+        try {
+          const res = await fetch('/api/enrich-gasos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ businessName: l.debtor_name }),
+          });
+          entry.gasos = await res.json();
+        } catch (err) {
+          entry.gasos = { status: 'error', error: err.message };
+        }
+      }
       // Apollo step
       if (enrichSources.apollo) {
         try {
           const res = await fetch('/api/enrich-apollo', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ businessName: l.debtor_name, state: 'GA' }),
+            body: JSON.stringify({
+              businessName: l.debtor_name,
+              state: 'GA',
+              revealEmail: apolloReveal.email,
+              revealPhone: apolloReveal.phone,
+            }),
           });
-          const data = await res.json();
-          entry.apollo = data;
+          entry.apollo = await res.json();
         } catch (err) {
           entry.apollo = { status: 'error', error: err.message };
         }
       }
-      // Batch step — needs owner name from Apollo (or skip if not available)
+      // BatchData skip-trace — chains off whichever source produced a usable
+      // first/last name. Apollo wins when both have a name (more likely the
+      // true owner). SoS registered agent is a fallback unless flagged as
+      // a commercial registered-agent service.
       if (enrichSources.batch) {
-        const owner = entry.apollo?.owner;
-        if (owner?.first_name || owner?.last_name) {
+        const apolloOwner = entry.apollo?.status === 'ok' ? entry.apollo.owner : null;
+        const sosAgent =
+          entry.gasos?.status === 'ok' && !entry.gasos.registered_agent?.likely_commercial
+            ? entry.gasos.registered_agent
+            : null;
+        const firstName = apolloOwner?.first_name || sosAgent?.first_name || '';
+        const lastName = apolloOwner?.last_name || sosAgent?.last_name || '';
+        const source = apolloOwner ? 'apollo' : (sosAgent ? 'gasos' : null);
+        if (firstName || lastName) {
           try {
             const res = await fetch('/api/enrich-batch', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
-                firstName: owner.first_name,
-                lastName: owner.last_name,
+                firstName,
+                lastName,
                 state: 'GA',
-                city: owner.city || entry.apollo?.business?.city,
+                city: apolloOwner?.city || entry.apollo?.business?.city || '',
               }),
             });
             const data = await res.json();
-            entry.batch = data;
+            entry.batch = { ...data, nameSource: source };
           } catch (err) {
             entry.batch = { status: 'error', error: err.message };
           }
         } else {
-          entry.batch = { status: 'skipped', reason: 'No owner identified by Apollo — Batch needs a first/last name' };
+          entry.batch = {
+            status: 'skipped',
+            reason: entry.gasos?.registered_agent?.likely_commercial
+              ? 'GA SoS agent is a commercial registered-agent service; no real person to skip-trace'
+              : 'No owner name found by Apollo or GA SoS — Batch needs a first/last name',
+          };
         }
       }
-      // Mark final enrichment status:
-      //   'ok'        — at least one source returned data
-      //   'no_match'  — Apollo returned 0 people (legitimate coverage gap, not an error)
-      //   'error'     — HTTP failure, network failure, missing API key, etc.
-      const apolloOk = entry.apollo?.status === 'ok';
-      const batchOk = entry.batch?.status === 'ok';
-      const apolloNoMatch = entry.apollo?.status === 'no_match';
-      if (apolloOk || batchOk) entry.status = 'ok';
-      else if (apolloNoMatch && !entry.batch?.error) entry.status = 'no_match';
-      else entry.status = 'error';
+      // Final entry status:
+      //   'ok'        — at least one source returned usable data
+      //   'no_match'  — none of the sources errored, but none found data
+      //   'error'     — at least one source actually errored (HTTP/auth/etc.)
+      const sources = [entry.gasos, entry.apollo, entry.batch].filter(Boolean);
+      const anyOk = sources.some(s => s?.status === 'ok');
+      const anyError = sources.some(s => s?.status === 'error' || s?.status === 'apollo_error');
+      if (anyOk) entry.status = 'ok';
+      else if (anyError) entry.status = 'error';
+      else entry.status = 'no_match';
       acc[key] = entry;
       setEnrichment({ ...acc });
     }
@@ -327,18 +373,36 @@ export default function App() {
   function getEnriched(l) {
     const e = enrichment[leadKey(l)];
     if (!e) return null;
+    const apolloOwner = e.apollo?.status === 'ok' ? e.apollo.owner : null;
+    const sosAgent = e.gasos?.status === 'ok' ? e.gasos.registered_agent : null;
+    const sosBusiness = e.gasos?.status === 'ok' ? e.gasos.business : null;
+    // Owner name preference: Apollo (most likely the true owner via title
+    // match) > SoS registered agent (when not a commercial service).
+    const ownerName =
+      apolloOwner?.full_name ||
+      (sosAgent && !sosAgent.likely_commercial ? sosAgent.full_name : '');
     return {
       business_phone: e.apollo?.business?.phone || '',
       business_website: e.apollo?.business?.website || '',
       industry: e.apollo?.business?.industry || '',
-      owner_name: e.apollo?.owner?.full_name || '',
-      owner_title: e.apollo?.owner?.title || '',
-      owner_email: e.apollo?.owner?.email || '',
-      owner_phone_business: e.apollo?.owner?.phone || '',
+      owner_name: ownerName,
+      owner_title: apolloOwner?.title || (sosAgent && !sosAgent.likely_commercial ? 'Registered Agent (GA SoS)' : ''),
+      owner_email: apolloOwner?.email || '',
+      owner_phone_business: apolloOwner?.phone || '',
       owner_mobile: e.batch?.person?.mobile || '',
       owner_landline: e.batch?.person?.landline || '',
       owner_personal_email: e.batch?.person?.email || '',
-      owner_address: e.batch?.person?.current_address || '',
+      owner_address: e.batch?.person?.current_address || sosBusiness?.principal_address || '',
+      // GA SoS data
+      sos_business_name: sosBusiness?.name || '',
+      sos_control_number: sosBusiness?.controlNumber || '',
+      sos_principal_address: sosBusiness?.principal_address || '',
+      sos_status: sosBusiness?.status || '',
+      sos_agent_name: sosAgent?.full_name || '',
+      sos_agent_is_commercial: sosAgent?.likely_commercial ? 'yes' : '',
+      // Per-source statuses for debugging in exports
+      gasos_status: e.gasos?.status || '',
+      gasos_error: e.gasos?.error || '',
       apollo_status: e.apollo?.status || '',
       apollo_error: e.apollo?.error || '',
       batch_status: e.batch?.status || '',
@@ -352,21 +416,29 @@ export default function App() {
     .filter(([, e]) => e.status === 'error' || e.status === 'no_match')
     .map(([key, e]) => {
       const [fileNumber, name] = key.split('|');
+      const sosStatus = e.gasos?.status || '';
+      const sosMsg = e.gasos?.error || e.gasos?.message || '';
+      const apolloStatus = e.apollo?.status || '';
       const apolloMsg = e.apollo?.error || e.apollo?.message || '';
       const batchMsg = e.batch?.error || '';
       const httpStatus = e.apollo?.httpStatus || null;
-      const apolloStatus = e.apollo?.status || '';
-      let detail =
-        apolloStatus === 'no_match' ? apolloMsg || 'Apollo: no people indexed for this business.' :
-        apolloStatus === 'apollo_error' ? `Apollo ${httpStatus || 'error'}: ${apolloMsg}` :
-        apolloStatus === 'error' ? `Apollo network/parse error: ${apolloMsg}` :
-        batchMsg ? `BatchData: ${batchMsg}` :
-        apolloMsg || batchMsg || `Unrecognized enrichment state (apollo.status="${apolloStatus}")`;
-      return { name, fileNumber, kind: e.status, detail, httpStatus, apolloStatus };
+      const parts = [];
+      if (sosStatus === 'no_match') parts.push('SoS: no entity found');
+      else if (sosStatus === 'error') parts.push(`SoS error: ${sosMsg}`);
+      if (apolloStatus === 'no_match') parts.push('Apollo: no people indexed');
+      else if (apolloStatus === 'apollo_error') parts.push(`Apollo ${httpStatus || 'error'}: ${apolloMsg}`);
+      else if (apolloStatus === 'error') parts.push(`Apollo: ${apolloMsg}`);
+      if (batchMsg) parts.push(`Batch: ${batchMsg}`);
+      const detail = parts.length ? parts.join(' · ') : `No data found (sos=${sosStatus || 'off'}, apollo=${apolloStatus || 'off'})`;
+      return { name, fileNumber, kind: e.status, detail, httpStatus, apolloStatus, sosStatus };
     });
   const enrichSuccess = Object.values(enrichment).filter(e => e.status === 'ok').length;
   const enrichNoMatch = Object.values(enrichment).filter(e => e.status === 'no_match').length;
   const enrichFailed = Object.values(enrichment).filter(e => e.status === 'error').length;
+  // Per-source success counts for the summary breakdown.
+  const sosOkCount = Object.values(enrichment).filter(e => e.gasos?.status === 'ok').length;
+  const apolloOkCount = Object.values(enrichment).filter(e => e.apollo?.status === 'ok').length;
+  const batchOkCount = Object.values(enrichment).filter(e => e.batch?.status === 'ok').length;
   // Only suggest the API-key fix when we see HTTP errors that actually look auth-related.
   const looksLikeAuthIssue = enrichFailures.some(f =>
     f.httpStatus === 401 || f.httpStatus === 403 ||
@@ -397,6 +469,8 @@ export default function App() {
       'file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender',
       'business_phone', 'business_website', 'industry',
       'owner_name', 'owner_title', 'owner_email', 'owner_phone',
+      'sos_principal_address', 'sos_agent_name', 'sos_control_number', 'sos_status',
+      'owner_mobile', 'owner_personal_email', 'owner_address',
     ];
     return [headers.join(','), ...rows.map(l => {
       const e = getEnriched(l) || {};
@@ -743,18 +817,66 @@ export default function App() {
       {leads.length > 0 && (
         <div className="panel">
           <div className="csv-tabs" style={{ marginBottom: '0.5rem' }}>
-            <strong>🔎 Enrichment (Apollo.io)</strong>
-            <span className="muted small-text">Finds owner name, business email, business phone, industry</span>
+            <strong>🔎 Enrichment</strong>
+            <span className="muted small-text">GA SoS → Apollo → BatchData skip-trace</span>
           </div>
-          <p className="hint" style={{ marginBottom: '0.75rem' }}>
-            For each lead, Apollo runs 2 calls (org enrich + people search at that org) to find the owner/founder/CEO. ~2 credits per lead ≈ $0.20.
-            Coverage typically 40–70% — better for established businesses, weaker for one-person LLCs.
-            Requires <code>APOLLO_API_KEY</code> env var set in Netlify.
+          <p className="hint" style={{ marginBottom: '0.5rem' }}>
+            Chained enrichment for each lead. GA Secretary of State (free, public) catches small LLCs Apollo doesn't index. Apollo (~2 credits ≈ $0.20/lead) covers established businesses. BatchData skip-traces whichever owner name we found to a personal cell + email.
           </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.5rem' }}>
+            <label className="small-text">
+              <input
+                type="checkbox"
+                checked={enrichSources.gasos}
+                onChange={e => setEnrichSources(s => ({ ...s, gasos: e.target.checked }))}
+              />{' '}
+              <strong>GA SoS</strong> (free, registered agent + principal address)
+            </label>
+            <label className="small-text">
+              <input
+                type="checkbox"
+                checked={enrichSources.apollo}
+                onChange={e => setEnrichSources(s => ({ ...s, apollo: e.target.checked }))}
+              />{' '}
+              <strong>Apollo</strong> (~2 credits/lead)
+            </label>
+            <label className="small-text">
+              <input
+                type="checkbox"
+                checked={enrichSources.batch}
+                onChange={e => setEnrichSources(s => ({ ...s, batch: e.target.checked }))}
+              />{' '}
+              <strong>BatchData</strong> skip-trace
+            </label>
+          </div>
+          {enrichSources.apollo && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginBottom: '0.75rem', paddingLeft: '1rem' }}>
+              <label className="small-text muted">
+                <input
+                  type="checkbox"
+                  checked={apolloReveal.email}
+                  onChange={e => setApolloReveal(r => ({ ...r, email: e.target.checked }))}
+                />{' '}
+                Apollo: reveal owner email (~1 credit/result)
+              </label>
+              <label className="small-text muted">
+                <input
+                  type="checkbox"
+                  checked={apolloReveal.phone}
+                  onChange={e => setApolloReveal(r => ({ ...r, phone: e.target.checked }))}
+                />{' '}
+                Apollo: reveal owner phone (~8 credits/result — expensive)
+              </label>
+            </div>
+          )}
           <div className="submit-row" style={{ paddingTop: 0, borderTop: 'none' }}>
             {!enriching ? (
-              <button type="button" onClick={enrichAll}>
-                Enrich {leads.filter(l => enrichment[leadKey(l)]?.status !== 'ok').length} lead{leads.length === 1 ? '' : 's'} with Apollo
+              <button
+                type="button"
+                onClick={enrichAll}
+                disabled={!enrichSources.gasos && !enrichSources.apollo && !enrichSources.batch}
+              >
+                Enrich {leads.filter(l => enrichment[leadKey(l)]?.status !== 'ok').length} lead{leads.length === 1 ? '' : 's'}
               </button>
             ) : (
               <button type="button" onClick={cancelEnrich}>Stop enrichment</button>
@@ -771,8 +893,11 @@ export default function App() {
               <div className="small-text">
                 <strong>Enrichment summary:</strong>{' '}
                 <span style={{ color: 'var(--good)' }}>✓ {enrichSuccess} succeeded</span>
-                {enrichNoMatch > 0 && <>{' · '}<span className="muted">○ {enrichNoMatch} not in Apollo</span></>}
+                {enrichNoMatch > 0 && <>{' · '}<span className="muted">○ {enrichNoMatch} no data</span></>}
                 {enrichFailed > 0 && <>{' · '}<span style={{ color: 'var(--error)' }}>✗ {enrichFailed} failed</span></>}
+              </div>
+              <div className="small-text muted" style={{ marginTop: '0.2rem' }}>
+                By source: GA SoS {sosOkCount} · Apollo {apolloOkCount} · BatchData {batchOkCount}
               </div>
               {enrichFailures.length > 0 && (
                 <details style={{ marginTop: '0.4rem' }} open>
@@ -791,16 +916,16 @@ export default function App() {
                   </ul>
                   {enrichNoMatch > 0 && enrichFailed === 0 && (
                     <p className="hint" style={{ marginTop: '0.4rem' }}>
-                      "Not in Apollo" is normal for small/one-person LLCs — Apollo's data skews toward established businesses with public LinkedIn footprints. This isn't a bug, it's a coverage gap.
+                      "No data" usually means the business is a recent / out-of-state / very small LLC neither GA SoS nor Apollo has indexed. Try enabling BatchData skip-trace if it's not already on.
                     </p>
                   )}
                   {looksLikeAuthIssue && (
                     <p className="hint" style={{ marginTop: '0.4rem' }}>
-                      The HTTP 401/403 above suggests an auth problem: check that <code>APOLLO_API_KEY</code> is set in Netlify (Site configuration → Environment variables) and that the key has Master API access enabled in Apollo. Trigger a new deploy after changing env vars.
+                      An HTTP 401/403 above suggests an auth problem: check <code>APOLLO_API_KEY</code> / <code>FIRECRAWL_API_KEY</code> / <code>BATCHDATA_API_KEY</code> in Netlify (Site configuration → Environment variables) and trigger a new deploy.
                     </p>
                   )}
                   <p className="hint" style={{ marginTop: '0.4rem' }}>
-                    For more diagnostics see the Netlify Functions log (logs prefixed <code>[apollo]</code>).
+                    For more diagnostics see the Netlify Functions log (look for <code>[gasos]</code> and <code>[apollo]</code> prefixes).
                   </p>
                 </details>
               )}
