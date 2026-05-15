@@ -604,59 +604,75 @@ export default function App() {
     })].join('\n');
   }
   function ghlCsv(rows) {
-    // GHL is contact-centric (one row = one person). When we have BOTH an
-    // Apollo CEO/owner AND a SoS registered agent for the same business,
-    // emit TWO rows so both contacts get into the user's CRM. GHL groups
-    // them by Company Name automatically. Tags identify which source each
-    // contact came from.
-    const headers = ['First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address', 'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes'];
+    // One row per business. Primary contact preference:
+    //   1. SoS registered agent (non-commercial) — legally authoritative
+    //   2. Apollo title-matched person
+    //   3. Empty (still emit the row so the filing is in GHL)
+    // The OTHER source (if any) goes into a single Apollo_Contact column —
+    // a GHL custom field the user can map to a structured field if they want
+    // to filter/automate on it, or leave it ignored.
+    const headers = [
+      'First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address',
+      'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes',
+      'Apollo_Contact', 'SoS_Agent',
+    ];
     const userTags = customTags.split(',').map(t => t.trim()).filter(Boolean);
     const out = [headers.join(',')];
     for (const l of rows) {
       const e = getEnriched(l) || {};
       const contacts = buildContacts(l);
-      // If no enrichment produced any contact, still emit a placeholder row
-      // with just the company name so the user knows the filing exists.
-      const rowContacts = contacts.length ? contacts : [{
-        source: 'none', first_name: '', last_name: '', title: '', email: '', phone: '',
-        mobile: '', landline: '', address: e.sos_principal_address || '',
-      }];
-      for (const c of rowContacts) {
-        const autoTags = [
-          'ucc-ga-lead',
-          l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`,
-          l.document_type && `doc-${l.document_type.toLowerCase()}`,
-          e.industry && `industry-${e.industry.toLowerCase().replace(/\s+/g, '-')}`,
-          c.source !== 'none' && `contact-source-${c.source}`,
-          c.title && `title-${c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
-          c.mobile && 'has-cell',
-          c.email && 'has-email',
-        ].filter(Boolean);
-        const tags = [...autoTags, ...userTags].join('; ');
-        const noteParts = [
-          notesPrefix && notesPrefix.trim(),
-          `UCC #${l.file_number}`,
-          l.date_filed && `Filed: ${l.date_filed}`,
-          l.document_type && `Type: ${l.document_type}`,
-          l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`,
-          e.business_website && `Site: ${e.business_website}`,
-          c.title && `Title: ${c.title}`,
-          c.landline && `Landline: ${c.landline}`,
-          // Cross-reference the OTHER contact so the user knows who else to try
-          c.source === 'apollo' && e.sos_agent_name && !e.sos_agent_is_commercial &&
-            `Also try: ${e.sos_agent_name} (SoS Registered Agent)`,
-          c.source === 'sos-agent' && e.apollo_owner_name &&
-            `Also try: ${e.apollo_owner_name}${e.apollo_owner_title ? `, ${e.apollo_owner_title}` : ''} (Apollo)`,
-        ].filter(Boolean);
-        const notes = noteParts.join(' | ');
-        out.push([
-          c.first_name, c.last_name, c.email, c.phone,
-          l.debtor_name, c.address || '', '', 'GA', '', 'US',
-          `GA UCC - ${l.source_lender}`, tags, notes,
-        ].map(csvCell).join(','));
-      }
+      const sosContact = contacts.find(c => c.source === 'sos-agent') || null;
+      const apolloContact = contacts.find(c => c.source === 'apollo') || null;
+      const primary = sosContact || apolloContact || {
+        source: 'none', first_name: '', last_name: '', title: '',
+        email: '', phone: '', mobile: '', landline: '',
+        address: e.sos_principal_address || '',
+      };
+      // Structured "alternate contact" fields for GHL custom-field mapping.
+      const apolloField = apolloContact && primary.source !== 'apollo'
+        ? formatAltContact(apolloContact)
+        : '';
+      const sosField = sosContact && primary.source !== 'sos-agent'
+        ? formatAltContact(sosContact)
+        : '';
+      const autoTags = [
+        'ucc-ga-lead',
+        l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`,
+        l.document_type && `doc-${l.document_type.toLowerCase()}`,
+        e.industry && `industry-${e.industry.toLowerCase().replace(/\s+/g, '-')}`,
+        primary.source !== 'none' && `primary-${primary.source}`,
+        primary.title && `title-${primary.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
+        primary.mobile && 'has-cell',
+        primary.email && 'has-email',
+      ].filter(Boolean);
+      const tags = [...autoTags, ...userTags].join('; ');
+      const noteParts = [
+        notesPrefix && notesPrefix.trim(),
+        `UCC #${l.file_number}`,
+        l.date_filed && `Filed: ${l.date_filed}`,
+        l.document_type && `Type: ${l.document_type}`,
+        l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`,
+        e.business_website && `Site: ${e.business_website}`,
+        primary.title && `Title: ${primary.title}`,
+        primary.landline && `Landline: ${primary.landline}`,
+      ].filter(Boolean);
+      const notes = noteParts.join(' | ');
+      out.push([
+        primary.first_name, primary.last_name, primary.email, primary.phone,
+        l.debtor_name, primary.address || '', '', 'GA', '', 'US',
+        `GA UCC - ${l.source_lender}`, tags, notes,
+        apolloField, sosField,
+      ].map(csvCell).join(','));
     }
     return out.join('\n');
+  }
+  // Compact one-line representation of an alternate contact for GHL custom
+  // fields. Format chosen to be both human-readable and easy to parse later.
+  function formatAltContact(c) {
+    if (!c) return '';
+    const name = [c.first_name, c.last_name].filter(Boolean).join(' ');
+    const parts = [name, c.title, c.email, c.phone].filter(Boolean);
+    return parts.join(' | ');
   }
   function jsonExport(rows) { return JSON.stringify(rows, null, 2); }
   function csvCell(v) { return `"${(v ?? '').toString().replace(/"/g, '""')}"`; }
