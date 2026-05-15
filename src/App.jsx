@@ -22,14 +22,14 @@ const MCA_LENDERS = [
 ];
 
 const DOC_TYPES = [
-  { id: 'Original',     label: 'Original',     desc: 'Fresh UCC-1 — best MCA leads' },
-  { id: 'Amendment',    label: 'Amendment',    desc: 'Modified existing loan' },
-  { id: 'Continuation', label: 'Continuation', desc: 'Extended 5-year filing' },
-  { id: 'Assignment',   label: 'Assignment',   desc: 'Lender sold the debt' },
-  { id: 'Termination',  label: 'Termination',  desc: 'Loan paid off — not useful for MCA' },
+  { id: 'Original',     label: 'Original',     desc: 'Fresh UCC-1 — actively in debt, prime stack/refi target' },
+  { id: 'Amendment',    label: 'Amendment',    desc: 'Modified existing loan — still active borrower' },
+  { id: 'Continuation', label: 'Continuation', desc: '5-year extension — still active long-term borrower' },
+  { id: 'Assignment',   label: 'Assignment',   desc: 'Lender sold/transferred the debt' },
+  { id: 'Termination',  label: 'Termination',  desc: 'Loan paid off — proven borrower, ready for a new MCA' },
 ];
 
-const DEFAULT_DOC_TYPES = ['Original', 'Amendment', 'Continuation'];
+const DEFAULT_DOC_TYPES = ['Original', 'Amendment', 'Continuation', 'Termination'];
 
 const DEFAULT_LENDERS = ['CELTIC BANK'];
 
@@ -47,6 +47,11 @@ const POLL_INTERVAL_MS = 3000;
 // We warn the user if the job appears stuck (no field changes for STUCK_WARN_MS)
 // but never auto-kill — they cancel manually.
 const STUCK_WARN_MS = 90000;
+
+// Empirical: 1 variants scrape + ~N drill scrapes per lender, each scrape ≈ 1
+// Firecrawl credit. Most lenders surface 5–15 name variants, so ~12 is a
+// reasonable single-number estimate to show before a sweep runs.
+const CREDITS_PER_LENDER = 12;
 
 function mmddyyyy(d) { return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`; }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -410,6 +415,12 @@ export default function App() {
       enrich_status: e.status || '',
     };
   }
+  // Total lenders in this sweep = picked-from-chips + custom-typed-names.
+  // Estimated cost up front so the user knows what they're about to spend.
+  const customLenderCount = customNames.split(',').map(s => s.trim()).filter(Boolean).length;
+  const lenderCount = selectedLenders.length + customLenderCount;
+  const estimatedCredits = lenderCount * CREDITS_PER_LENDER;
+
   // Per-lead failure detail so the user can actually see what's failing.
   // Each row: { name, fileNumber, kind: 'error'|'no_match', detail, httpStatus? }
   const enrichFailures = Object.entries(enrichment)
@@ -562,8 +573,10 @@ export default function App() {
           </fieldset>
           <fieldset>
             <legend>Lenders selected</legend>
-            <div className="big-num" style={{ paddingTop: '0.4rem' }}>{selectedLenders.length + customNames.split(',').filter(s => s.trim()).length}</div>
-            <p className="hint">~12 Firecrawl credits per lender. ~25–40s each.</p>
+            <div className="big-num" style={{ paddingTop: '0.4rem' }}>{lenderCount}</div>
+            <p className="hint">
+              Estimated cost: <strong>~{estimatedCredits} Firecrawl credits</strong> (~12 credits/lender · ~25–40s each)
+            </p>
           </fieldset>
         </div>
 
@@ -575,6 +588,7 @@ export default function App() {
             ))}
           </div>
           <div className="actions">
+            <button type="button" className="link" onClick={() => setSelectedLenders([...MCA_LENDERS])}>Select all</button>
             <button type="button" className="link" onClick={() => setSelectedLenders([...DEFAULT_LENDERS])}>Reset to defaults</button>
             <button type="button" className="link" onClick={() => setSelectedLenders([])}>Clear</button>
           </div>
@@ -596,13 +610,16 @@ export default function App() {
           </div>
           <details className="doc-cheat">
             <summary><strong>📖 Document type cheat sheet — MCA lead quality guide</strong></summary>
+            <p className="hint" style={{ marginTop: '0.4rem' }}>
+              UCC document types are uniform across all 50 states (Article 9 of the Uniform Commercial Code), so the same definitions apply to Georgia, Florida, and everywhere else.
+            </p>
             <table className="compact">
               <thead><tr><th>Type</th><th>What it means</th><th>MCA value</th></tr></thead>
               <tbody>
                 <tr>
                   <td><strong>Original</strong></td>
                   <td>Fresh UCC-1 financing statement. Brand-new loan just filed.</td>
-                  <td>🟢 <strong>Best leads</strong> — they just took on debt, may want to stack/refi</td>
+                  <td>🟢 <strong>Prime</strong> — currently in debt, candidate for stack/refi</td>
                 </tr>
                 <tr>
                   <td><strong>Amendment</strong></td>
@@ -617,7 +634,7 @@ export default function App() {
                 <tr>
                   <td><strong>Termination</strong></td>
                   <td>Releases the security interest. Loan was paid off / settled.</td>
-                  <td>🔴 <strong>Worthless for MCA</strong> — they have no more debt</td>
+                  <td>🟢 <strong>Proven</strong> — they took on debt and paid it back. Great re-engagement target for a new MCA.</td>
                 </tr>
                 <tr>
                   <td><strong>Assignment</strong></td>
@@ -627,7 +644,7 @@ export default function App() {
               </tbody>
             </table>
             <p className="hint">
-              Filter is applied client-side after scraping — change anytime without re-running. Default: Original + Amendment + Continuation. Termination off by default (no MCA value).
+              Filter is applied client-side after scraping — change anytime without re-running. Default: all types except Assignment.
             </p>
           </details>
         </fieldset>
@@ -672,7 +689,7 @@ export default function App() {
         <div className="panel live-status">
           <div className="live-row">
             <div>
-              <div className="big-num">{currentIdx}<span className="small">/{selectedLenders.length + customNames.split(',').filter(s => s.trim()).length}</span></div>
+              <div className="big-num">{currentIdx}<span className="small">/{lenderCount}</span></div>
               <div className="big-label">Lender</div>
             </div>
             <div>
@@ -693,7 +710,7 @@ export default function App() {
             </div>
           </div>
           <div className="progress-bar">
-            <div style={{ width: `${(currentIdx - 1) / Math.max(1, selectedLenders.length + customNames.split(',').filter(s => s.trim()).length) * 100}%` }} />
+            <div style={{ width: `${(currentIdx - 1) / Math.max(1, lenderCount) * 100}%` }} />
           </div>
           <div className="muted small-text">
             Phase: <code>{phase}</code>
