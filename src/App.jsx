@@ -403,29 +403,40 @@ export default function App() {
     const apolloOwner = e.apollo?.status === 'ok' ? e.apollo.owner : null;
     const sosAgent = e.gasos?.status === 'ok' ? e.gasos.registered_agent : null;
     const sosBusiness = e.gasos?.status === 'ok' ? e.gasos.business : null;
-    // Owner name preference: Apollo (most likely the true owner via title
-    // match) > SoS registered agent (when not a commercial service).
+    const sosAgentUsable = sosAgent && !sosAgent.likely_commercial;
+    // Legacy single-owner view (used by Raw CSV's existing owner_* columns and
+    // the table UI). For GHL we use buildContacts() below to emit BOTH.
     const ownerName =
       apolloOwner?.full_name ||
-      (sosAgent && !sosAgent.likely_commercial ? sosAgent.full_name : '');
+      (sosAgentUsable ? sosAgent.full_name : '');
     return {
       business_phone: e.apollo?.business?.phone || '',
       business_website: e.apollo?.business?.website || '',
       industry: e.apollo?.business?.industry || '',
       owner_name: ownerName,
-      owner_title: apolloOwner?.title || (sosAgent && !sosAgent.likely_commercial ? 'Registered Agent (GA SoS)' : ''),
+      owner_title: apolloOwner?.title || (sosAgentUsable ? 'Registered Agent (GA SoS)' : ''),
       owner_email: apolloOwner?.email || '',
       owner_phone_business: apolloOwner?.phone || '',
       owner_mobile: e.batch?.person?.mobile || '',
       owner_landline: e.batch?.person?.landline || '',
       owner_personal_email: e.batch?.person?.email || '',
       owner_address: e.batch?.person?.current_address || sosBusiness?.principal_address || '',
-      // GA SoS data
+      // Apollo source columns — always populated when Apollo found someone.
+      apollo_owner_name: apolloOwner?.full_name || '',
+      apollo_owner_first: apolloOwner?.first_name || '',
+      apollo_owner_last: apolloOwner?.last_name || '',
+      apollo_owner_title: apolloOwner?.title || '',
+      apollo_owner_email: apolloOwner?.email || '',
+      apollo_owner_phone: apolloOwner?.phone || '',
+      apollo_owner_linkedin: apolloOwner?.linkedin_url || '',
+      // GA SoS source columns — always populated when SoS found the entity.
       sos_business_name: sosBusiness?.name || '',
       sos_control_number: sosBusiness?.controlNumber || '',
       sos_principal_address: sosBusiness?.principal_address || '',
       sos_status: sosBusiness?.status || '',
       sos_agent_name: sosAgent?.full_name || '',
+      sos_agent_first: sosAgent?.first_name || '',
+      sos_agent_last: sosAgent?.last_name || '',
       sos_agent_is_commercial: sosAgent?.likely_commercial ? 'yes' : '',
       // Per-source statuses for debugging in exports
       gasos_status: e.gasos?.status || '',
@@ -436,6 +447,64 @@ export default function App() {
       batch_error: e.batch?.error || '',
       enrich_status: e.status || '',
     };
+  }
+
+  // Build the list of contacts for a lead — one per source that found a real
+  // person. Apollo + SoS-agent-non-commercial each yield one contact, so a
+  // lead can produce 0, 1, or 2 GHL rows. BatchData skip-trace data is
+  // attached to whichever contact name it was run against (currently: the
+  // Apollo owner if present, else the SoS agent).
+  function buildContacts(l) {
+    const e = enrichment[leadKey(l)];
+    if (!e) return [];
+    const apolloOwner = e.apollo?.status === 'ok' ? e.apollo.owner : null;
+    const sosAgent = e.gasos?.status === 'ok' ? e.gasos.registered_agent : null;
+    const sosBusiness = e.gasos?.status === 'ok' ? e.gasos.business : null;
+    const batchPerson = e.batch?.status === 'ok' ? e.batch.person : null;
+    // BatchData was run on whichever name we passed it in enrichAll(). Today
+    // that's Apollo-first then SoS-agent. So attach Batch to the matching
+    // source. If names disagree this could be slightly off — defensive but
+    // not perfect; the Raw CSV's explicit batch_* columns still show the
+    // ground truth.
+    const batchAttachedTo =
+      apolloOwner?.first_name && batchPerson?.first_name &&
+      apolloOwner.first_name.toLowerCase() === (batchPerson.first_name || '').toLowerCase()
+        ? 'apollo'
+        : sosAgent?.first_name && batchPerson?.first_name &&
+          sosAgent.first_name.toLowerCase() === (batchPerson.first_name || '').toLowerCase()
+          ? 'sos'
+          : (apolloOwner ? 'apollo' : 'sos');
+
+    const contacts = [];
+    if (apolloOwner) {
+      const isBatch = batchAttachedTo === 'apollo' && batchPerson;
+      contacts.push({
+        source: 'apollo',
+        first_name: apolloOwner.first_name || '',
+        last_name: apolloOwner.last_name || '',
+        title: apolloOwner.title || '',
+        email: apolloOwner.email || (isBatch ? batchPerson.email : '') || '',
+        phone: (isBatch ? batchPerson.mobile : '') || apolloOwner.phone || (isBatch ? batchPerson.landline : '') || '',
+        mobile: isBatch ? batchPerson.mobile : '',
+        landline: isBatch ? batchPerson.landline : '',
+        address: (isBatch ? batchPerson.current_address : '') || sosBusiness?.principal_address || '',
+      });
+    }
+    if (sosAgent && !sosAgent.likely_commercial) {
+      const isBatch = batchAttachedTo === 'sos' && batchPerson;
+      contacts.push({
+        source: 'sos-agent',
+        first_name: sosAgent.first_name || '',
+        last_name: sosAgent.last_name || '',
+        title: 'Registered Agent (GA SoS)',
+        email: isBatch ? (batchPerson.email || '') : '',
+        phone: (isBatch ? batchPerson.mobile : '') || (isBatch ? batchPerson.landline : '') || '',
+        mobile: isBatch ? batchPerson.mobile : '',
+        landline: isBatch ? batchPerson.landline : '',
+        address: (isBatch ? batchPerson.current_address : '') || sosBusiness?.principal_address || '',
+      });
+    }
+    return contacts;
   }
   // Total lenders in this sweep = picked-from-chips + custom-typed-names.
   // Estimated cost up front so the user knows what they're about to spend.
@@ -511,12 +580,22 @@ export default function App() {
   });
 
   function rawCsv(rows) {
+    // Filing columns + side-by-side per-source columns so conflicts between
+    // Apollo and SoS are explicit. Legacy merged owner_* columns stay so any
+    // downstream scripts that read them keep working.
     const headers = [
       'file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender',
       'business_phone', 'business_website', 'industry',
+      // Apollo source columns (1st choice)
+      'apollo_owner_name', 'apollo_owner_first', 'apollo_owner_last', 'apollo_owner_title',
+      'apollo_owner_email', 'apollo_owner_phone', 'apollo_owner_linkedin',
+      // SoS source columns
+      'sos_business_name', 'sos_status', 'sos_control_number', 'sos_principal_address',
+      'sos_agent_name', 'sos_agent_first', 'sos_agent_last', 'sos_agent_is_commercial',
+      // BatchData skip-trace columns
+      'owner_mobile', 'owner_landline', 'owner_personal_email', 'owner_address',
+      // Legacy merged owner view (best-pick) for backward compat
       'owner_name', 'owner_title', 'owner_email', 'owner_phone',
-      'sos_principal_address', 'sos_agent_name', 'sos_control_number', 'sos_status',
-      'owner_mobile', 'owner_personal_email', 'owner_address',
     ];
     return [headers.join(','), ...rows.map(l => {
       const e = getEnriched(l) || {};
@@ -525,36 +604,59 @@ export default function App() {
     })].join('\n');
   }
   function ghlCsv(rows) {
+    // GHL is contact-centric (one row = one person). When we have BOTH an
+    // Apollo CEO/owner AND a SoS registered agent for the same business,
+    // emit TWO rows so both contacts get into the user's CRM. GHL groups
+    // them by Company Name automatically. Tags identify which source each
+    // contact came from.
     const headers = ['First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address', 'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes'];
     const userTags = customTags.split(',').map(t => t.trim()).filter(Boolean);
-    return [headers.join(','), ...rows.map(l => {
+    const out = [headers.join(',')];
+    for (const l of rows) {
       const e = getEnriched(l) || {};
-      const [firstName, ...rest] = (e.owner_name || '').split(' ');
-      const lastName = rest.join(' ');
-      const email = e.owner_email || e.owner_personal_email || '';
-      const phone = e.owner_mobile || e.owner_phone_business || e.business_phone || e.owner_landline || '';
-      const autoTags = [
-        'ucc-ga-lead',
-        l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`,
-        l.document_type && `doc-${l.document_type.toLowerCase()}`,
-        e.industry && `industry-${e.industry.toLowerCase().replace(/\s+/g, '-')}`,
-        e.owner_mobile && 'has-cell',
-        email && 'has-email',
-      ].filter(Boolean);
-      const tags = [...autoTags, ...userTags].join('; ');
-      const noteParts = [
-        notesPrefix && notesPrefix.trim(),
-        `UCC #${l.file_number}`,
-        l.date_filed && `Filed: ${l.date_filed}`,
-        l.document_type && `Type: ${l.document_type}`,
-        l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`,
-        e.business_website && `Site: ${e.business_website}`,
-        e.owner_title && `Owner title: ${e.owner_title}`,
-        e.owner_landline && `Landline: ${e.owner_landline}`,
-      ].filter(Boolean);
-      const notes = noteParts.join(' | ');
-      return [firstName || '', lastName, email, phone, l.debtor_name, e.owner_address || '', '', 'GA', '', 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
-    })].join('\n');
+      const contacts = buildContacts(l);
+      // If no enrichment produced any contact, still emit a placeholder row
+      // with just the company name so the user knows the filing exists.
+      const rowContacts = contacts.length ? contacts : [{
+        source: 'none', first_name: '', last_name: '', title: '', email: '', phone: '',
+        mobile: '', landline: '', address: e.sos_principal_address || '',
+      }];
+      for (const c of rowContacts) {
+        const autoTags = [
+          'ucc-ga-lead',
+          l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`,
+          l.document_type && `doc-${l.document_type.toLowerCase()}`,
+          e.industry && `industry-${e.industry.toLowerCase().replace(/\s+/g, '-')}`,
+          c.source !== 'none' && `contact-source-${c.source}`,
+          c.title && `title-${c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
+          c.mobile && 'has-cell',
+          c.email && 'has-email',
+        ].filter(Boolean);
+        const tags = [...autoTags, ...userTags].join('; ');
+        const noteParts = [
+          notesPrefix && notesPrefix.trim(),
+          `UCC #${l.file_number}`,
+          l.date_filed && `Filed: ${l.date_filed}`,
+          l.document_type && `Type: ${l.document_type}`,
+          l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`,
+          e.business_website && `Site: ${e.business_website}`,
+          c.title && `Title: ${c.title}`,
+          c.landline && `Landline: ${c.landline}`,
+          // Cross-reference the OTHER contact so the user knows who else to try
+          c.source === 'apollo' && e.sos_agent_name && !e.sos_agent_is_commercial &&
+            `Also try: ${e.sos_agent_name} (SoS Registered Agent)`,
+          c.source === 'sos-agent' && e.apollo_owner_name &&
+            `Also try: ${e.apollo_owner_name}${e.apollo_owner_title ? `, ${e.apollo_owner_title}` : ''} (Apollo)`,
+        ].filter(Boolean);
+        const notes = noteParts.join(' | ');
+        out.push([
+          c.first_name, c.last_name, c.email, c.phone,
+          l.debtor_name, c.address || '', '', 'GA', '', 'US',
+          `GA UCC - ${l.source_lender}`, tags, notes,
+        ].map(csvCell).join(','));
+      }
+    }
+    return out.join('\n');
   }
   function jsonExport(rows) { return JSON.stringify(rows, null, 2); }
   function csvCell(v) { return `"${(v ?? '').toString().replace(/"/g, '""')}"`; }
@@ -1039,7 +1141,25 @@ export default function App() {
                     <td>{l.document_type}</td>
                     <td>{l.date_filed}</td>
                     <td>
-                      {e?.owner_name ? <><strong>{e.owner_name}</strong><div className="muted small-text">{e.owner_title}</div></> : <span className="muted">—</span>}
+                      {(() => {
+                        const contacts = buildContacts(l);
+                        if (!contacts.length) return <span className="muted">—</span>;
+                        // Stack both contacts when both sources found someone.
+                        return (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
+                            {contacts.map((c, i) => (
+                              <div key={i}>
+                                <strong>{[c.first_name, c.last_name].filter(Boolean).join(' ') || '—'}</strong>
+                                <div className="muted small-text">
+                                  {c.title}
+                                  {c.source === 'apollo' && ' (Apollo)'}
+                                  {c.source === 'sos-agent' && ' (GA SoS)'}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td>{phone || <span className="muted">—</span>}{e?.owner_mobile && <div className="muted small-text">📱 mobile</div>}</td>
                     <td>{email || <span className="muted">—</span>}</td>
