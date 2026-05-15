@@ -274,12 +274,23 @@ export default function App() {
     setError(null);
     setEnriching(true);
     enrichCancelRef.current = false;
-    const targets = leads;
+    // Dedupe by normalized debtor name so the same business across multiple
+    // filings (Original + Amendment for the same LLC, etc.) costs ONE Apollo
+    // + SoS lookup instead of N. Keep the first occurrence as the canonical
+    // lead for progress display.
+    const seen = new Set();
+    const targets = [];
+    for (const l of leads) {
+      const k = leadKey(l);
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      targets.push(l);
+    }
     const acc = { ...enrichment };
     for (let i = 0; i < targets.length; i++) {
       if (enrichCancelRef.current) break;
       const l = targets[i];
-      const key = l.file_number + '|' + l.debtor_name;
+      const key = leadKey(l);
       setEnrichProgress({ current: i + 1, total: targets.length, lender: l.debtor_name });
       if (acc[key]?.status === 'ok') continue; // already enriched
 
@@ -374,7 +385,18 @@ export default function App() {
 
   function cancelEnrich() { enrichCancelRef.current = true; }
 
-  function leadKey(l) { return l.file_number + '|' + l.debtor_name; }
+  // Enrichment cache key is the NORMALIZED debtor name — same business across
+  // multiple filings (e.g. two Amendments for "BLACK WATER HOLDINGS, LLC")
+  // shares one Apollo/SoS lookup. Normalization: uppercase + collapse
+  // whitespace + strip punctuation. We deliberately keep entity suffix
+  // (LLC vs INC) so distinct legal entities don't collide.
+  function leadKey(l) {
+    return (l.debtor_name || '')
+      .toUpperCase()
+      .replace(/[.,]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
   function getEnriched(l) {
     const e = enrichment[leadKey(l)];
     if (!e) return null;
@@ -420,6 +442,19 @@ export default function App() {
   const customLenderCount = customNames.split(',').map(s => s.trim()).filter(Boolean).length;
   const lenderCount = selectedLenders.length + customLenderCount;
   const estimatedCredits = lenderCount * CREDITS_PER_LENDER;
+
+  // Count of distinct debtors still needing enrichment — drives the button
+  // label and gives the user a real picture of API spend before clicking.
+  const uniqueLeadsToEnrich = (() => {
+    const seen = new Set();
+    for (const l of leads) {
+      const k = leadKey(l);
+      if (!k || seen.has(k)) continue;
+      if (enrichment[k]?.status === 'ok') continue;
+      seen.add(k);
+    }
+    return seen.size;
+  })();
 
   // Per-lead failure detail so the user can actually see what's failing.
   // Each row: { name, fileNumber, kind: 'error'|'no_match', detail, httpStatus? }
@@ -893,7 +928,7 @@ export default function App() {
                 onClick={enrichAll}
                 disabled={!enrichSources.gasos && !enrichSources.apollo && !enrichSources.batch}
               >
-                Enrich {leads.filter(l => enrichment[leadKey(l)]?.status !== 'ok').length} lead{leads.length === 1 ? '' : 's'}
+                Enrich {uniqueLeadsToEnrich} unique lead{uniqueLeadsToEnrich === 1 ? '' : 's'}
               </button>
             ) : (
               <button type="button" onClick={cancelEnrich}>Stop enrichment</button>
