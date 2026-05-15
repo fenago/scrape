@@ -1,13 +1,24 @@
 import { useEffect, useRef, useState } from 'react';
 
 const MCA_LENDERS = [
+  // High-volume bank originators for fintech MCAs:
   'CELTIC BANK', 'WEBBANK', 'CROSS RIVER BANK', 'AMERICAN EXPRESS NATIONAL BANK',
+  // Direct MCA / fintech lenders — known active UCC filers:
   'KABBAGE', 'ON DECK CAPITAL', 'BLUEVINE', 'FUNDING CIRCLE',
   'SQUARE FINANCIAL SERVICES', 'FUNDBOX', 'SHOPIFY CAPITAL', 'CAN CAPITAL',
   'RAPID FINANCIAL', 'CREDIBLY', 'WORLD BUSINESS LENDERS', 'PEARL CAPITAL',
   'EVEREST BUSINESS FUNDING', 'EBF', 'MULLIGAN FUNDING', 'QUICKBRIDGE',
   'STRATEGIC FUNDING', 'IOU FINANCIAL', 'GREEN CAPITAL FUNDING', 'BIZFUND',
   'FOX CAPITAL', 'LENDISTRY', 'LENDR', 'KAPITUS',
+  // Added round 2 — well-known MCA shops also active in UCC filings:
+  'LIBERTAS FUNDING', 'FORA FINANCIAL', 'KNIGHTSBRIDGE FUNDING',
+  'CFG MERCHANT SOLUTIONS', 'RELIANT FUNDING', 'VOX FUNDING',
+  'UNITED CAPITAL SOURCE', 'CHANNEL PARTNERS CAPITAL', 'NEWCO CAPITAL',
+  'HENRY BUSINESS CAPITAL', 'SBG FUNDING', 'HEADWAY CAPITAL', 'TORRO',
+  'THE LCF GROUP', 'FUNDKITE', 'PREMIUM MERCHANT FUNDING', 'PIRS CAPITAL',
+  'SNAP ADVANCES', 'UPWISE CAPITAL', 'NEWTEK BUSINESS LENDING',
+  'NATIONAL BUSINESS CAPITAL', 'BREAKOUT CAPITAL', 'YELLOWSTONE CAPITAL',
+  'FUNDRY', 'CAPITAL ONE BUSINESS',
 ];
 
 const DOC_TYPES = [
@@ -350,10 +361,42 @@ export default function App() {
               </button>
             ))}
           </div>
-          <p className="hint">
-            <strong>Original</strong> = fresh UCC-1, best for MCA. <strong>Amendment</strong>/<strong>Continuation</strong> = active loans. <strong>Termination</strong> = paid off, not useful.
-            Filter is applied client-side after scraping — change anytime without re-running.
-          </p>
+          <details className="doc-cheat">
+            <summary><strong>📖 Document type cheat sheet — MCA lead quality guide</strong></summary>
+            <table className="compact">
+              <thead><tr><th>Type</th><th>What it means</th><th>MCA value</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Original</strong></td>
+                  <td>Fresh UCC-1 financing statement. Brand-new loan just filed.</td>
+                  <td>🟢 <strong>Best leads</strong> — they just took on debt, may want to stack/refi</td>
+                </tr>
+                <tr>
+                  <td><strong>Amendment</strong></td>
+                  <td>UCC-3 modifies an existing filing (collateral change, add debtor, etc.)</td>
+                  <td>🟡 Active borrower, still owes</td>
+                </tr>
+                <tr>
+                  <td><strong>Continuation</strong></td>
+                  <td>Extends life of existing filing past the 5-year mark</td>
+                  <td>🟡 Active borrower, long-term — loan still going</td>
+                </tr>
+                <tr>
+                  <td><strong>Termination</strong></td>
+                  <td>Releases the security interest. Loan was paid off / settled.</td>
+                  <td>🔴 <strong>Worthless for MCA</strong> — they have no more debt</td>
+                </tr>
+                <tr>
+                  <td><strong>Assignment</strong></td>
+                  <td>Lender sold/transferred the debt to another party</td>
+                  <td>⚪ Neutral — borrower still owes, but to someone else</td>
+                </tr>
+              </tbody>
+            </table>
+            <p className="hint">
+              Filter is applied client-side after scraping — change anytime without re-running. Default: Original + Amendment + Continuation. Termination off by default (no MCA value).
+            </p>
+          </details>
         </fieldset>
 
         <fieldset>
