@@ -10,7 +10,15 @@ const MCA_LENDERS = [
   'FOX CAPITAL', 'LENDISTRY', 'LENDR', 'KAPITUS',
 ];
 
-const DEFAULT_LENDERS = ['CELTIC BANK'];
+const DOC_TYPES = [
+  { id: 'Original',     label: 'Original',     desc: 'Fresh UCC-1 — best MCA leads' },
+  { id: 'Amendment',    label: 'Amendment',    desc: 'Modified existing loan' },
+  { id: 'Continuation', label: 'Continuation', desc: 'Extended 5-year filing' },
+  { id: 'Assignment',   label: 'Assignment',   desc: 'Lender sold the debt' },
+  { id: 'Termination',  label: 'Termination',  desc: 'Loan paid off — not useful for MCA' },
+];
+
+const DEFAULT_DOC_TYPES = ['Original', 'Amendment', 'Continuation'];
 
 const TIME_WINDOWS = [
   { id: '7d',   label: 'Last 7 days',   days: 7 },
@@ -37,6 +45,9 @@ export default function App() {
   const [selectedLenders, setSelectedLenders] = useState([...DEFAULT_LENDERS]);
   const [customNames, setCustomNames] = useState('');
   const [preview, setPreview] = useState('raw'); // 'raw' | 'ghl' | 'json'
+  const [docTypeFilter, setDocTypeFilter] = useState([...DEFAULT_DOC_TYPES]);
+  const [customTags, setCustomTags] = useState('');
+  const [notesPrefix, setNotesPrefix] = useState('');
 
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState('idle');    // 'idle' | 'submitting' | 'polling' | 'parsing' | 'done'
@@ -211,8 +222,8 @@ export default function App() {
     cancelRef.current = true;
   }
 
-  // Aggregate + dedupe (on file_number + debtor_name).
-  const leads = (() => {
+  // Aggregate + dedupe (on file_number + debtor_name) + filter by doc type.
+  const allLeads = (() => {
     const seen = new Set();
     const out = [];
     for (const q of perLender) {
@@ -225,6 +236,10 @@ export default function App() {
     }
     return out;
   })();
+  const leads = allLeads.filter(l => {
+    if (!docTypeFilter.length) return true;
+    return docTypeFilter.includes(l.document_type);
+  });
 
   function rawCsv(rows) {
     const headers = ['file_number', 'document_type', 'debtor_name', 'date_filed', 'original_file_number', 'source_lender'];
@@ -232,9 +247,22 @@ export default function App() {
   }
   function ghlCsv(rows) {
     const headers = ['First Name', 'Last Name', 'Email', 'Phone', 'Company Name', 'Address', 'City', 'State', 'Postal Code', 'Country', 'Source', 'Tags', 'Notes'];
+    const userTags = customTags.split(',').map(t => t.trim()).filter(Boolean);
     return [headers.join(','), ...rows.map(l => {
-      const tags = ['ucc-ga-lead', l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`, l.document_type && `doc-${l.document_type.toLowerCase()}`].filter(Boolean).join('; ');
-      const notes = [`UCC #${l.file_number}`, l.date_filed && `Filed: ${l.date_filed}`, l.document_type && `Type: ${l.document_type}`, l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`].filter(Boolean).join(' | ');
+      const autoTags = [
+        'ucc-ga-lead',
+        l.source_lender && `lender-${l.source_lender.toLowerCase().replace(/\s+/g, '-')}`,
+        l.document_type && `doc-${l.document_type.toLowerCase()}`,
+      ].filter(Boolean);
+      const tags = [...autoTags, ...userTags].join('; ');
+      const noteParts = [
+        notesPrefix && notesPrefix.trim(),
+        `UCC #${l.file_number}`,
+        l.date_filed && `Filed: ${l.date_filed}`,
+        l.document_type && `Type: ${l.document_type}`,
+        l.original_file_number && l.original_file_number !== 'N/A' && `Original: ${l.original_file_number}`,
+      ].filter(Boolean);
+      const notes = noteParts.join(' | ');
       return ['', '', '', '', l.debtor_name, '', '', 'GA', '', 'US', `GA UCC - ${l.source_lender}`, tags, notes].map(csvCell).join(',');
     })].join('\n');
   }
@@ -311,6 +339,32 @@ export default function App() {
         <fieldset>
           <legend>Extra lender names (optional, comma-separated)</legend>
           <input type="text" value={customNames} onChange={e => setCustomNames(e.target.value)} placeholder="e.g. STRIPE CAPITAL, BREX" />
+        </fieldset>
+
+        <fieldset>
+          <legend>Filter by document type ({docTypeFilter.length} selected — applied to results)</legend>
+          <div className="chips">
+            {DOC_TYPES.map(t => (
+              <button key={t.id} type="button" className={`chip ${docTypeFilter.includes(t.id) ? 'on' : ''}`} title={t.desc} onClick={() => setDocTypeFilter(curr => curr.includes(t.id) ? curr.filter(x => x !== t.id) : [...curr, t.id])}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <p className="hint">
+            <strong>Original</strong> = fresh UCC-1, best for MCA. <strong>Amendment</strong>/<strong>Continuation</strong> = active loans. <strong>Termination</strong> = paid off, not useful.
+            Filter is applied client-side after scraping — change anytime without re-running.
+          </p>
+        </fieldset>
+
+        <fieldset>
+          <legend>GHL custom tags (appended to auto-tags, comma-separated)</legend>
+          <input type="text" value={customTags} onChange={e => setCustomTags(e.target.value)} placeholder="e.g. mca-campaign-jan, hot-list, cold-call-batch-1" />
+          <p className="hint">Auto-tags always added: <code>ucc-ga-lead</code>, <code>lender-celtic-bank</code>, <code>doc-original</code>, etc.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>GHL Notes prefix (optional, prepended to every contact's Notes)</legend>
+          <input type="text" value={notesPrefix} onChange={e => setNotesPrefix(e.target.value)} placeholder="e.g. Imported 2026-01-15 batch · MCA refi opportunity" />
         </fieldset>
 
         <div className="submit-row">
@@ -399,8 +453,8 @@ export default function App() {
               <div className="big-label">Lenders done</div>
             </div>
             <div>
-              <div className="big-num">{leads.length}</div>
-              <div className="big-label">Unique leads</div>
+              <div className="big-num">{leads.length}<span className="small">/{allLeads.length}</span></div>
+              <div className="big-label">Leads (filtered/total)</div>
             </div>
             <div>
               <div className="big-num">{totalFilings}</div>
